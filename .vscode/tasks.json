@@ -1,0 +1,31 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build-sfml",
+      "type": "shell",
+      "command": "cl",
+      "args": [
+        "/Zi",
+        "/EHsc",
+        "/std:c++17",
+        "/I", "E:/Libraries/SFML-2.6.1/include",
+        "src/main.cpp",
+        "/link",
+        "/LIBPATH:E:/Libraries/SFML-2.6.1/lib",
+        "sfml-graphics.lib",
+        "sfml-window.lib",
+        "sfml-system.lib",
+        "/OUT:PlanetSim.exe"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$msCompile"]
+    }
+  ]
+}
