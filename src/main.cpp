@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <iostream>
+#include <cstdio>   // snprintf
 
 // --------------------
 // Basic 2d vector
@@ -31,7 +32,7 @@ double length(const Vec2& v) {
 }
 
 // --------------------
-// bodies
+// Body types
 // --------------------
 struct BodyTypeInfo {
     std::string name;
@@ -43,6 +44,9 @@ static BodyTypeInfo genericPlanetType{
     "non-tectonic rocky planet with low surface temperatures and thin/absent atmosphere"
 };
 
+// --------------------
+// Bodies
+// --------------------
 struct Body {
     double mass;         // kg
     Vec2   position;     // meters
@@ -50,47 +54,40 @@ struct Body {
     Vec2   acceleration; // m/s^2
     sf::Color color;
 
-    // phys-ish properties (internal units, not strictly SI for radius)
     double density;
-    double radius;       // drawn in pixels
+    double radius;       // pixels
     bool   fixed = false;
+    bool   ghost = false; // ghost: visible but no gravity / motion
 
-    // metadata
     std::string  name;
     BodyTypeInfo typeInfo = genericPlanetType;
 
-    // trail (positions in meters)
-    std::vector<Vec2> trail;
+    std::vector<Vec2> trail; // positions in meters
 };
 
 // --------------------
 // Global sim parameters
 // --------------------
 
-// Physical gravitational constant (SI)
-const double G_PHYS = 6.67430e-11;      // m^3 kg^-1 s^-2
+// Physical constants
+const double G_PHYS = 6.67430e-11;          // m^3 kg^-1 s^-2
+const double YEAR_SECONDS = 365.25 * 24.0 * 3600.0;
 
-// Simulation scale
-// 1 pixel represents this many meters
-const double METERS_PER_PIXEL = 1.0e9;  // 1e9 m = 1 px --> 1 AU ~= 150 px
+const double M_SUN   = 1.98847e30;         // kg
+const double M_EARTH = 5.97219e24;         // kg
 
-// 1 real-time second = TIME_SCALE simulated seconds
-const double TIME_SCALE = 86400.0;      // 1 real s = 1 simulated day
+// Simulation scale (mutable)
+double metersPerPixel = 1.0e9;             // 1 px = 1e9 m
+double timeScale      = 86400.0;           // 1 real s = 1 simulated day
 
-// Softening length in meters
-const double SOFTENING_METERS = 1.0e9;  // ~1 px of softening
-
-// Mass helpers
-const double M_SUN   = 1.98847e30;      // kg
-const double M_EARTH = 5.97219e24;      // kg
+// Softening in meters
+const double SOFTENING_METERS = 1.0e9;
 
 bool trailsEnabled = true;
 int  maxTrailPoints = 200;
+bool lockVolume     = false;               // volume lock for mass editing
 
-// volume lock
-bool lockVolume = false;
-
-// helpers for radius/density
+// helpers for radius/density (just internal consistency)
 double computeVolumeFromRadius(double r) {
     const double pi = 3.141592653589793;
     return 4.0 / 3.0 * pi * r * r * r;
@@ -106,18 +103,34 @@ double computeRadiusFromMassDensity(double mass, double density) {
 
 void updateBodyAfterMassChange(Body& b) {
     if (!lockVolume) {
-        // keep density and recompute radius
         b.radius = computeRadiusFromMassDensity(b.mass, b.density);
     } else {
-        // keep radius, recompute density
         double volume = computeVolumeFromRadius(b.radius);
         if (volume <= 0.0) volume = 1.0;
         b.density = b.mass / volume;
     }
 }
 
+// simple scientific notation formatter
+std::string formatSci(double v, int prec = 3) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.*e", prec, v);
+    return std::string(buf);
+}
+
+// nice distance formatter
+std::string formatDistance(double meters) {
+    char buf[64];
+    if (meters >= 1.0e12)      std::snprintf(buf, sizeof(buf), "%.3f Tm", meters / 1.0e12);
+    else if (meters >= 1.0e9)  std::snprintf(buf, sizeof(buf), "%.3f Gm", meters / 1.0e9);
+    else if (meters >= 1.0e6)  std::snprintf(buf, sizeof(buf), "%.3f Mm", meters / 1.0e6);
+    else if (meters >= 1.0e3)  std::snprintf(buf, sizeof(buf), "%.3f km", meters / 1.0e3);
+    else                       std::snprintf(buf, sizeof(buf), "%.0f m", meters);
+    return std::string(buf);
+}
+
 // --------------------
-// Compute grav accelerations (Newtonian)
+// Gravity (Newtonian)
 // --------------------
 void computeGravity(std::vector<Body>& bodies) {
     std::size_t n = bodies.size();
@@ -127,7 +140,10 @@ void computeGravity(std::vector<Body>& bodies) {
     }
 
     for (std::size_t i = 0; i < n; ++i) {
+        if (bodies[i].ghost) continue; // ghosts don't feel gravity
         for (std::size_t j = i + 1; j < n; ++j) {
+            if (bodies[j].ghost) continue; // ghosts don't exert gravity
+
             Vec2 r = bodies[j].position - bodies[i].position; // meters
             double dist2 = r.x * r.x + r.y * r.y;
             double softened2 = dist2 + SOFTENING_METERS * SOFTENING_METERS;
@@ -136,7 +152,6 @@ void computeGravity(std::vector<Body>& bodies) {
 
             double invDist3 = 1.0 / (softened2 * softened);
 
-            // a_i = G * m_j * r / |r|^3
             Vec2 accel_i = r * (G_PHYS * bodies[j].mass * invDist3);
             Vec2 accel_j = r * (-G_PHYS * bodies[i].mass * invDist3);
 
@@ -150,17 +165,17 @@ void computeGravity(std::vector<Body>& bodies) {
 // integrator
 // --------------------
 void step(std::vector<Body>& bodies, double dtRealSeconds) {
-    double dt = dtRealSeconds * TIME_SCALE;  // seconds of simulated time
+    double dt = dtRealSeconds * timeScale;  // seconds of simulated time
 
     for (auto& b : bodies) {
-        if (!b.fixed) {
-            b.velocity += b.acceleration * dt; // m/s
+        if (!b.fixed && !b.ghost) {
+            b.velocity += b.acceleration * dt;
         }
     }
 
     for (auto& b : bodies) {
-        if (!b.fixed) {
-            b.position += b.velocity * dt;     // meters
+        if (!b.fixed && !b.ghost) {
+            b.position += b.velocity * dt;
         }
     }
 
@@ -168,9 +183,11 @@ void step(std::vector<Body>& bodies, double dtRealSeconds) {
 
     if (trailsEnabled) {
         for (auto& b : bodies) {
-            b.trail.push_back(b.position);
-            if ((int)b.trail.size() > maxTrailPoints) {
-                b.trail.erase(b.trail.begin());
+            if (!b.ghost) {
+                b.trail.push_back(b.position);
+                if ((int)b.trail.size() > maxTrailPoints) {
+                    b.trail.erase(b.trail.begin());
+                }
             }
         }
     } else {
@@ -184,7 +201,8 @@ void step(std::vector<Body>& bodies, double dtRealSeconds) {
 enum class InteractionMode {
     AddStill,
     AddMoving,
-    AddOrbiting
+    AddOrbitingPlace, // click to place ghost
+    OrbitEdit         // ghost orbit edit + overlay
 };
 
 // find nearest body to a world-space point (meters)
@@ -210,11 +228,12 @@ int findStrongestInfluenceParent(const std::vector<Body>& bodies, const Vec2& po
     double bestAccel = 0.0;
 
     for (std::size_t i = 0; i < bodies.size(); ++i) {
+        if (bodies[i].ghost) continue;
         Vec2 r = bodies[i].position - posMeters;
         double dist2 = r.x * r.x + r.y * r.y;
         if (dist2 <= 0.0) continue;
 
-        double accel = G_PHYS * bodies[i].mass / dist2; // magnitude GM/r^2
+        double accel = G_PHYS * bodies[i].mass / dist2;
         if (accel > bestAccel) {
             bestAccel = accel;
             bestIndex = static_cast<int>(i);
@@ -232,8 +251,8 @@ sf::Vector2f worldToScreen(const Vec2& p, double width, double height) {
     double cx = width * 0.5;
     double cy = height * 0.5;
 
-    double dx = (p.x - viewCenterWorld.x) / METERS_PER_PIXEL;
-    double dy = (p.y - viewCenterWorld.y) / METERS_PER_PIXEL;
+    double dx = (p.x - viewCenterWorld.x) / metersPerPixel;
+    double dy = (p.y - viewCenterWorld.y) / metersPerPixel;
 
     double x = cx + dx;
     double y = cy + dy;
@@ -251,8 +270,163 @@ struct BodyPanel {
     sf::Vector2f dragOffset{0.0f, 0.0f};
 };
 
-bool pointInRect(const sf::Vector2f& p, const sf::FloatRect& r) {
-    return r.contains(p);
+// --------------------
+// Orbit overlay for OrbitEdit
+// --------------------
+void drawOrbitOverlay(
+    sf::RenderWindow& window,
+    const Body& body,
+    const Body& parent,
+    double width,
+    double height,
+    const sf::Font& font
+) {
+    // Barycenter (2-body)
+    double Mtot = body.mass + parent.mass;
+    Vec2 bary{
+        (body.position.x * body.mass + parent.position.x * parent.mass) / Mtot,
+        (body.position.y * body.mass + parent.position.y * parent.mass) / Mtot
+    };
+
+    Vec2 relBody = body.position - bary;
+    Vec2 relParent = parent.position - bary;
+    double a = length(relBody);
+    if (a <= 0.0) return;
+
+    // approximated as circle radius a
+    const int SEGMENTS = 256;
+    std::vector<sf::Vertex> orbitLine;
+    orbitLine.reserve(SEGMENTS + 1);
+    for (int i = 0; i <= SEGMENTS; ++i) {
+        double t = (double)i / SEGMENTS;
+        double ang = t * 2.0 * 3.141592653589793;
+        Vec2 pWorld{ bary.x + a * std::cos(ang), bary.y + a * std::sin(ang) };
+        sf::Vector2f s = worldToScreen(pWorld, width, height);
+        orbitLine.emplace_back(s, sf::Color(0, 150, 255)); // blue
+    }
+    window.draw(orbitLine.data(), orbitLine.size(), sf::LineStrip);
+
+    // barycenter point
+    sf::Vector2f baryScreen = worldToScreen(bary, width, height);
+    sf::CircleShape baryPt(4.0f);
+    baryPt.setOrigin(4.0f, 4.0f);
+    baryPt.setPosition(baryScreen);
+    baryPt.setFillColor(sf::Color::Red);
+    window.draw(baryPt);
+
+    // Pe direction: from barycenter towards parent
+    double distParent = length(relParent);
+    if (distParent <= 0.0) return;
+    Vec2 peDir{ relParent.x / distParent, relParent.y / distParent };
+
+    Vec2 peWorld{ bary.x + a * peDir.x, bary.y + a * peDir.y };
+    Vec2 apWorld{ bary.x - a * peDir.x, bary.y - a * peDir.y };
+
+    sf::Vector2f peScreen = worldToScreen(peWorld, width, height);
+    sf::Vector2f apScreen = worldToScreen(apWorld, width, height);
+
+    // dashed lines
+    auto drawDashed = [&](const sf::Vector2f& A, const sf::Vector2f& B) {
+        const float dashLen = 8.0f;
+        const float gapLen  = 4.0f;
+        sf::Vector2f d = B - A;
+        float len = std::sqrt(d.x*d.x + d.y*d.y);
+        if (len <= 0.0f) return;
+        sf::Vector2f dir = d / len;
+        float pos = 0.0f;
+        while (pos < len) {
+            float seg = std::min(dashLen, len - pos);
+            sf::Vector2f s = A + dir * pos;
+            sf::Vector2f e = A + dir * (pos + seg);
+            sf::Vertex line[] = {
+                sf::Vertex(s, sf::Color::White),
+                sf::Vertex(e, sf::Color::White)
+            };
+            window.draw(line, 2, sf::Lines);
+            pos += dashLen + gapLen;
+        }
+    };
+
+    drawDashed(baryScreen, peScreen);
+    drawDashed(baryScreen, apScreen);
+
+    // Pe / Ap markers
+    sf::CircleShape pePt(4.0f);
+    pePt.setOrigin(4.0f, 4.0f);
+    pePt.setPosition(peScreen);
+    pePt.setFillColor(sf::Color(255, 100, 200));
+    window.draw(pePt);
+
+    sf::CircleShape apPt(4.0f);
+    apPt.setOrigin(4.0f, 4.0f);
+    apPt.setPosition(apScreen);
+    apPt.setFillColor(sf::Color(255, 100, 200));
+    window.draw(apPt);
+
+    if (font.getInfo().family.empty()) return;
+
+    sf::Text text;
+    text.setFont(font);
+    text.setCharacterSize(12);
+
+    text.setFillColor(sf::Color(255, 100, 200));
+    text.setString("Pe");
+    text.setPosition(peScreen.x + 6.0f, peScreen.y - 4.0f);
+    window.draw(text);
+
+    text.setString("Ap");
+    text.setPosition(apScreen.x + 6.0f, apScreen.y - 4.0f);
+    window.draw(text);
+
+    // distances (circular, so r(Pe)=r(Ap)=a)
+    text.setFillColor(sf::Color::White);
+    text.setString("r(Pe) = " + formatDistance(a));
+    text.setPosition((baryScreen.x + peScreen.x) * 0.5f + 4.0f,
+                     (baryScreen.y + peScreen.y) * 0.5f);
+    window.draw(text);
+
+    text.setString("r(Ap) = " + formatDistance(a));
+    text.setPosition((baryScreen.x + apScreen.x) * 0.5f + 4.0f,
+                     (baryScreen.y + apScreen.y) * 0.5f + 14.0f);
+    window.draw(text);
+
+    // true anomaly ν (angle from Pe)
+    Vec2 relFromBary = body.position - bary;
+    double angBody = std::atan2(relFromBary.y, relFromBary.x);
+    double angPe   = std::atan2(peDir.y, peDir.x);
+    double nu = angBody - angPe;
+    while (nu < 0.0) nu += 2.0 * 3.141592653589793;
+    while (nu >= 2.0 * 3.141592653589793) nu -= 2.0 * 3.141592653589793;
+    double nuDeg = nu * 180.0 / 3.141592653589793;
+
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "ν = %.2f°", nuDeg);
+    text.setFillColor(sf::Color::Green);
+    text.setString(buf);
+    sf::Vector2f bodyScreen = worldToScreen(body.position, width, height);
+    text.setPosition(bodyScreen.x + 8.0f, bodyScreen.y - 4.0f);
+    window.draw(text);
+
+    // orbital period (Kepler 3rd, 2-body)
+    double T = 2.0 * 3.141592653589793 * std::sqrt(a * a * a / (G_PHYS * (body.mass + parent.mass)));
+    double T_years = T / YEAR_SECONDS;
+    std::snprintf(buf, sizeof(buf), "P = %.3f yr", T_years);
+    text.setFillColor(sf::Color(0, 180, 255));
+    text.setString(buf);
+    sf::Vector2f labelPos = worldToScreen({bary.x + a, bary.y}, width, height);
+    text.setPosition(labelPos.x + 6.0f, labelPos.y + 4.0f);
+    window.draw(text);
+}
+
+// scale / time formatting
+std::string formatScale() {
+    return formatDistance(metersPerPixel) + " / px";
+}
+std::string formatTimeScaleStr() {
+    double daysPerSec = timeScale / 86400.0;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.3f days/s", daysPerSec);
+    return std::string(buf);
 }
 
 int main() {
@@ -293,25 +467,28 @@ int main() {
     bool renaming = false;
     std::string renameBuffer;
 
+    // orbit edit state
+    int orbitEditBodyIndex   = -1;
+    int orbitEditParentIndex = -1;
+
     // view centered on star
     viewCenterWorld = star.position;
 
     while (window.isOpen()) {
         sf::Event event;
         while (window.pollEvent(event)) {
+            // -------------------- Events --------------------
             if (event.type == sf::Event::Closed) {
                 window.close();
             }
             else if (event.type == sf::Event::KeyPressed) {
+                // global hotkeys
                 if (event.key.code == sf::Keyboard::Num1) {
                     mode = InteractionMode::AddStill;
-                    std::cout << "Mode: Add Still\n";
                 } else if (event.key.code == sf::Keyboard::Num2) {
                     mode = InteractionMode::AddMoving;
-                    std::cout << "Mode: Add Moving\n";
                 } else if (event.key.code == sf::Keyboard::Num3) {
-                    mode = InteractionMode::AddOrbiting;
-                    std::cout << "Mode: Add Orbiting\n";
+                    mode = InteractionMode::AddOrbitingPlace;
                 } else if (event.key.code == sf::Keyboard::Delete) {
                     if (selectedIndex >= 0 && selectedIndex < (int)bodies.size()) {
                         bodies.erase(bodies.begin() + selectedIndex);
@@ -330,8 +507,11 @@ int main() {
                         updateBodyAfterMassChange(bodies[selectedIndex]);
                     }
                 } else if (event.key.code == sf::Keyboard::Space && !renaming) {
-                    // reset system only when not renaming
+                    // reset system
                     bodies.clear();
+                    star.position = {0.0, 0.0};
+                    star.velocity = {0.0, 0.0};
+                    star.fixed    = true;
                     bodies.push_back(star);
                     computeGravity(bodies);
                     selectedIndex = -1;
@@ -339,6 +519,8 @@ int main() {
                     viewBodyIndex = -1;
                     viewCenterWorld = star.position;
                     for (auto& b : bodies) b.trail.clear();
+                    orbitEditBodyIndex = orbitEditParentIndex = -1;
+                    mode = InteractionMode::AddStill;
                 } else if (event.key.code == sf::Keyboard::T) {
                     trailsEnabled = !trailsEnabled;
                 } else if (event.key.code == sf::Keyboard::LBracket) {
@@ -365,19 +547,53 @@ int main() {
                         renameBuffer = bodies[selectedIndex].name;
                     }
                 } else if (event.key.code == sf::Keyboard::Escape) {
-                    renaming = false;
+                    // cancel rename OR orbit edit
+                    if (renaming) renaming = false;
+                    if (mode == InteractionMode::OrbitEdit &&
+                        orbitEditBodyIndex >= 0 &&
+                        orbitEditBodyIndex < (int)bodies.size()) {
+                        bodies.erase(bodies.begin() + orbitEditBodyIndex);
+                        selectedIndex = -1;
+                        bodyPanel.visible = false;
+                        orbitEditBodyIndex = orbitEditParentIndex = -1;
+                        mode = InteractionMode::AddOrbitingPlace;
+                        computeGravity(bodies);
+                    }
+                }
+                // zoom + time scale adjustments
+                else if (event.key.code == sf::Keyboard::Z) { // zoom in
+                    metersPerPixel *= 0.5;
+                    if (metersPerPixel < 1.0e7) metersPerPixel = 1.0e7;
+                } else if (event.key.code == sf::Keyboard::X) { // zoom out
+                    metersPerPixel *= 2.0;
+                    if (metersPerPixel > 1.0e12) metersPerPixel = 1.0e12;
+                } else if (event.key.code == sf::Keyboard::Comma) { // slower time
+                    timeScale *= 0.5;
+                    if (timeScale < 3600.0) timeScale = 3600.0; // >= 1 hr/s
+                } else if (event.key.code == sf::Keyboard::Period) { // faster time
+                    timeScale *= 2.0;
+                    if (timeScale > 1.0e7) timeScale = 1.0e7;
+                }
+
+                // OrbitEdit commit
+                if (mode == InteractionMode::OrbitEdit &&
+                    (event.key.code == sf::Keyboard::Enter || event.key.code == sf::Keyboard::Return)) {
+                    if (orbitEditBodyIndex >= 0 && orbitEditBodyIndex < (int)bodies.size()) {
+                        bodies[orbitEditBodyIndex].ghost = false;
+                        computeGravity(bodies);
+                    }
+                    mode = InteractionMode::AddOrbitingPlace;
+                    orbitEditBodyIndex = orbitEditParentIndex = -1;
                 }
             }
             // text input for renaming
             else if (event.type == sf::Event::TextEntered && renaming) {
                 if (event.text.unicode == '\r' || event.text.unicode == '\n') {
-                    // enter: commit
                     if (selectedIndex >= 0) {
                         bodies[selectedIndex].name = renameBuffer;
                     }
                     renaming = false;
                 } else if (event.text.unicode == 8) {
-                    // backspace
                     if (!renameBuffer.empty()) renameBuffer.pop_back();
                 } else if (event.text.unicode >= 32 && event.text.unicode < 127) {
                     renameBuffer.push_back(static_cast<char>(event.text.unicode));
@@ -387,6 +603,7 @@ int main() {
             else if (event.type == sf::Event::MouseButtonPressed) {
                 sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
 
+                // panel first
                 if (bodyPanel.visible) {
                     sf::FloatRect panelRect(bodyPanel.pos, bodyPanel.size);
                     sf::FloatRect titleRect(bodyPanel.pos.x, bodyPanel.pos.y, bodyPanel.size.x, 24.0f);
@@ -406,7 +623,6 @@ int main() {
                             );
 
                             if (closeRect.contains(mouseScreenF)) {
-                                // deselect on close
                                 bodyPanel.visible = false;
                                 selectedIndex = -1;
                                 continue;
@@ -414,89 +630,81 @@ int main() {
                                 bodyPanel.minimized = !bodyPanel.minimized;
                                 continue;
                             } else {
-                                // dragging
                                 bodyPanel.dragging = true;
                                 bodyPanel.dragOffset = mouseScreenF - bodyPanel.pos;
                                 continue;
                             }
                         } else if (panelRect.contains(mouseScreenF)) {
-                            // click inside panel content
-                            continue;
+                            continue; // click inside panel, ignore world
                         }
                     }
                 }
 
-                // panel doesn't want the event or we clicked outside it
+                double cx = WIDTH * 0.5;
+                double cy = HEIGHT * 0.5;
+                Vec2 worldPos{
+                    (mouseScreenF.x - cx) * metersPerPixel + viewCenterWorld.x,
+                    (mouseScreenF.y - cy) * metersPerPixel + viewCenterWorld.y
+                };
+
                 if (event.mouseButton.button == sf::Mouse::Left) {
-                    if (mode == InteractionMode::AddStill ||
-                        mode == InteractionMode::AddMoving ||
-                        mode == InteractionMode::AddOrbiting) {
-
-                        double cx = WIDTH * 0.5;
-                        double cy = HEIGHT * 0.5;
-                        // pixel -> meters
-                        Vec2 worldPos{
-                            (mouseScreenF.x - cx) * METERS_PER_PIXEL + viewCenterWorld.x,
-                            (mouseScreenF.y - cy) * METERS_PER_PIXEL + viewCenterWorld.y
-                        };
-
-                        if (mode == InteractionMode::AddStill) {
+                    if (mode == InteractionMode::AddStill) {
+                        Body b;
+                        b.mass    = M_EARTH;
+                        b.radius  = 6.0;
+                        double vol = computeVolumeFromRadius(b.radius);
+                        b.density  = b.mass / vol;
+                        b.position = worldPos;
+                        b.velocity = {0.0, 0.0};
+                        b.color    = sf::Color::Cyan;
+                        b.name     = "Body";
+                        bodies.push_back(b);
+                        computeGravity(bodies);
+                    }
+                    else if (mode == InteractionMode::AddMoving) {
+                        isDraggingAddMoving = true;
+                        dragStart = worldPos;
+                    }
+                    else if (mode == InteractionMode::AddOrbitingPlace) {
+                        int parentIdx = findStrongestInfluenceParent(bodies, worldPos);
+                        if (parentIdx < 0) {
+                            std::cout << "No parent body found for orbiting placement.\n";
+                        } else {
                             Body b;
                             b.mass    = M_EARTH;
-                            b.radius  = 6.0; // pixels (visual)
+                            b.radius  = 6.0;
                             double vol = computeVolumeFromRadius(b.radius);
                             b.density  = b.mass / vol;
                             b.position = worldPos;
-                            b.velocity = {0.0, 0.0};
-                            b.color    = sf::Color::Cyan;
-                            b.name     = "Body";
+                            b.color    = sf::Color::Green;
+                            b.name     = "Orbiting body";
+                            b.ghost    = true;
+
+                            Body& parent = bodies[parentIdx];
+                            Vec2 r = b.position - parent.position;
+                            double dist = length(r);
+                            if (dist < SOFTENING_METERS) dist = SOFTENING_METERS;
+
+                            double vmag = std::sqrt(G_PHYS * parent.mass / dist);
+                            Vec2 rhat{ r.x / dist, r.y / dist };
+                            Vec2 perp{ -rhat.y, rhat.x };
+                            Vec2 vOrb = perp * vmag;
+
+                            b.velocity = parent.velocity + vOrb;
+
                             bodies.push_back(b);
-                            computeGravity(bodies);
-                        } else if (mode == InteractionMode::AddMoving) {
-                            isDraggingAddMoving = true;
-                            dragStart = worldPos;
-                        } else if (mode == InteractionMode::AddOrbiting) {
-                            // pick parent by strongest gravitational influence
-                            int parentIdx = findStrongestInfluenceParent(bodies, worldPos);
-                            if (parentIdx < 0) {
-                                std::cout << "No parent body found for orbiting placement.\n";
-                            } else {
-                                Body b;
-                                b.mass    = M_EARTH;
-                                b.radius  = 6.0;
-                                double vol = computeVolumeFromRadius(b.radius);
-                                b.density  = b.mass / vol;
-                                b.position = worldPos;
-                                b.color    = sf::Color::Green;
-                                b.name     = "Orbiting body";
-
-                                Body& parent = bodies[parentIdx];
-                                Vec2 r = b.position - parent.position;
-                                double dist = length(r);
-                                if (dist < SOFTENING_METERS) dist = SOFTENING_METERS;
-
-                                double vmag = std::sqrt(G_PHYS * parent.mass / dist);
-                                Vec2 rhat{ r.x / dist, r.y / dist };
-                                Vec2 perp{ -rhat.y, rhat.x };
-                                Vec2 vOrb = perp * vmag;
-
-                                b.velocity = parent.velocity + vOrb;
-
-                                bodies.push_back(b);
-                                computeGravity(bodies);
-                            }
+                            orbitEditBodyIndex   = (int)bodies.size() - 1;
+                            orbitEditParentIndex = parentIdx;
+                            selectedIndex        = orbitEditBodyIndex;
+                            bodyPanel.visible    = true;
+                            bodyPanel.minimized  = false;
+                            computeGravity(bodies); // ghosts ignored anyway
+                            mode = InteractionMode::OrbitEdit;
                         }
                     }
-                } else if (event.mouseButton.button == sf::Mouse::Right) {
-                    // select nearest body (world-space)
-                    double cx = WIDTH * 0.5;
-                    double cy = HEIGHT * 0.5;
-                    Vec2 worldPos{
-                        (mouseScreenF.x - cx) * METERS_PER_PIXEL + viewCenterWorld.x,
-                        (mouseScreenF.y - cy) * METERS_PER_PIXEL + viewCenterWorld.y
-                    };
-
-                    double maxDistMeters = 25.0 * METERS_PER_PIXEL; // 25 px selection radius
+                }
+                else if (event.mouseButton.button == sf::Mouse::Right) {
+                    double maxDistMeters = 25.0 * metersPerPixel;
                     int idx = findNearestBody(bodies, worldPos, maxDistMeters);
                     selectedIndex = idx;
                     if (idx >= 0) {
@@ -505,7 +713,6 @@ int main() {
                     }
                 }
             }
-            // im tired boss
             // mouse release
             else if (event.type == sf::Event::MouseButtonReleased) {
                 if (event.mouseButton.button == sf::Mouse::Left) {
@@ -519,13 +726,12 @@ int main() {
                         double cx = WIDTH * 0.5;
                         double cy = HEIGHT * 0.5;
                         Vec2 worldEnd{
-                            (mouseScreenF.x - cx) * METERS_PER_PIXEL + viewCenterWorld.x,
-                            (mouseScreenF.y - cy) * METERS_PER_PIXEL + viewCenterWorld.y
+                            (mouseScreenF.x - cx) * metersPerPixel + viewCenterWorld.x,
+                            (mouseScreenF.y - cy) * metersPerPixel + viewCenterWorld.y
                         };
 
                         Vec2 delta = worldEnd - dragStart;
-                        // scale down to get a reasonable initial speed
-                        Vec2 vel = delta * 1e-5; // tweak factor to taste
+                        Vec2 vel   = delta * 1e-5; // tweak factor
 
                         Body b;
                         b.mass    = M_EARTH;
@@ -541,8 +747,7 @@ int main() {
                     }
                 }
             }
-
-            // --- Mouse move (for dragging panel) ---
+            // mouse move (for dragging panel)
             else if (event.type == sf::Event::MouseMoved) {
                 if (bodyPanel.dragging) {
                     sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
@@ -582,6 +787,18 @@ int main() {
             }
         }
 
+        // AddMoving velocity arrow
+        if (isDraggingAddMoving) {
+            sf::Vector2f startScreen = worldToScreen(dragStart, WIDTH, HEIGHT);
+            sf::Vector2i mousePix = sf::Mouse::getPosition(window);
+            sf::Vector2f mouseScreenF = window.mapPixelToCoords(mousePix);
+            sf::Vertex line[] = {
+                sf::Vertex(startScreen, sf::Color::White),
+                sf::Vertex(mouseScreenF, sf::Color::White)
+            };
+            window.draw(line, 2, sf::Lines);
+        }
+
         // Draw bodies
         for (std::size_t i = 0; i < bodies.size(); ++i) {
             const Body& b = bodies[i];
@@ -599,9 +816,21 @@ int main() {
             } else if (b.fixed) {
                 circle.setOutlineThickness(1.5f);
                 circle.setOutlineColor(sf::Color(200, 200, 50));
+            } else if (b.ghost) {
+                circle.setOutlineThickness(1.5f);
+                circle.setOutlineColor(sf::Color(0, 150, 255));
             }
 
             window.draw(circle);
+        }
+
+        // Orbit overlay in OrbitEdit
+        if (fontLoaded &&
+            mode == InteractionMode::OrbitEdit &&
+            orbitEditBodyIndex >= 0 && orbitEditBodyIndex < (int)bodies.size() &&
+            orbitEditParentIndex >= 0 && orbitEditParentIndex < (int)bodies.size()) {
+            drawOrbitOverlay(window, bodies[orbitEditBodyIndex], bodies[orbitEditParentIndex],
+                             WIDTH, HEIGHT, font);
         }
 
         // HUD
@@ -613,9 +842,10 @@ int main() {
             text.setPosition(10.0f, 10.0f);
 
             std::string modeStr;
-            if (mode == InteractionMode::AddStill) modeStr = "Add Still (1)";
+            if (mode == InteractionMode::AddStill)       modeStr = "Add Still (1)";
             else if (mode == InteractionMode::AddMoving) modeStr = "Add Moving (2)";
-            else modeStr = "Add Orbiting (3)";
+            else if (mode == InteractionMode::AddOrbitingPlace || mode == InteractionMode::OrbitEdit)
+                modeStr = "Add Orbiting (3)";
 
             std::string selStr = "None";
             if (selectedIndex >= 0 && selectedIndex < (int)bodies.size()) {
@@ -624,21 +854,39 @@ int main() {
 
             std::string hud =
                 "M1: add body   M2: select body\n"
-                "1: add still   2: add moving   3: add orbiting\n"
+                "1: add still   2: add moving   3: add orbiting (Enter=commit, Esc=cancel)\n"
                 "Del: delete selected   Up/Down: change mass\n"
                 "T: toggle trails  [ ]: trail length\n"
                 "V: toggle volume lock   X: toggle fixed\n"
-                "F: follow selected   F2: rename   Space: reset\n" +
+                "F: follow selected   F2: rename   Space: reset\n"
+                "Z/X: zoom in/out   ,/. : slower/faster time\n" +
                 std::string("Mode: ") + modeStr +
                 "   Selected: " + selStr +
                 (lockVolume ? "   [Volume LOCKED]" : "   [Volume UNLOCKED]");
 
             text.setString(hud);
             window.draw(text);
+
+            // bottom-left: scale + time
+            sf::Text scaleText;
+            scaleText.setFont(font);
+            scaleText.setCharacterSize(14);
+            scaleText.setFillColor(sf::Color::White);
+            scaleText.setPosition(10.0f, HEIGHT - 40.0f);
+            scaleText.setString("Scale: " + formatScale());
+            window.draw(scaleText);
+
+            sf::Text timeText;
+            timeText.setFont(font);
+            timeText.setCharacterSize(14);
+            timeText.setFillColor(sf::Color::White);
+            timeText.setPosition(10.0f, HEIGHT - 22.0f);
+            timeText.setString("Time:  " + formatTimeScaleStr());
+            window.draw(timeText);
         }
 
         // Body panel
-        if (bodyPanel.visible && selectedIndex >= 0 && selectedIndex < (int)bodies.size()) {
+        if (fontLoaded && bodyPanel.visible && selectedIndex >= 0 && selectedIndex < (int)bodies.size()) {
             Body& b = bodies[selectedIndex];
 
             sf::RectangleShape panel;
@@ -649,7 +897,6 @@ int main() {
             panel.setOutlineColor(sf::Color::White);
             window.draw(panel);
 
-            // Title bar
             float titleH = 24.0f;
             sf::RectangleShape titleBar(sf::Vector2f(bodyPanel.size.x, titleH));
             titleBar.setPosition(bodyPanel.pos);
@@ -664,7 +911,6 @@ int main() {
             title.setString("Body Editor");
             window.draw(title);
 
-            // Minimize & close buttons
             float btnSize = 16.0f;
             sf::RectangleShape closeBtn(sf::Vector2f(btnSize, btnSize));
             closeBtn.setPosition(bodyPanel.pos.x + bodyPanel.size.x - btnSize - 4.0f, bodyPanel.pos.y + 4.0f);
@@ -717,30 +963,30 @@ int main() {
                 window.draw(line);
                 y += 20.0f;
 
-                // Mass
+                // Mass (scientific)
                 line.setPosition(x, y);
-                line.setString("Mass: " + std::to_string(b.mass));
+                line.setString("Mass: " + formatSci(b.mass) + " kg");
                 window.draw(line);
                 y += 20.0f;
 
                 // Density
                 line.setPosition(x, y);
-                line.setString("Density: " + std::to_string(b.density));
+                line.setString("Density: " + formatSci(b.density));
                 window.draw(line);
                 y += 20.0f;
 
-                // Radius
+                // Radius (pixels)
                 line.setPosition(x, y);
-                line.setString("Radius: " + std::to_string(b.radius));
+                line.setString("Radius: " + formatSci(b.radius) + " px");
                 window.draw(line);
                 y += 20.0f;
 
                 // Flags
-                line.setPosition(x, y);
                 std::string flags = "Fixed: ";
                 flags += (b.fixed ? "Yes" : "No");
                 flags += "   Volume lock: ";
                 flags += (lockVolume ? "On" : "Off");
+                line.setPosition(x, y);
                 line.setString(flags);
                 window.draw(line);
                 y += 20.0f;
