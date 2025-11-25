@@ -246,6 +246,11 @@ int findStrongestInfluenceParent(const std::vector<Body>& bodies, const Vec2& po
 Vec2 viewCenterWorld{0.0, 0.0};
 int  viewBodyIndex = -1;
 
+// Philippians 4:13
+enum class OrbitHandle { None, Body, Pe, Ap };
+OrbitHandle orbitDragHandle = OrbitHandle::None;
+bool orbitDragging = false;
+
 // world (meters) -> screen (pixels)
 sf::Vector2f worldToScreen(const Vec2& p, double width, double height) {
     double cx = width * 0.5;
@@ -273,6 +278,68 @@ struct BodyPanel {
 // --------------------
 // Orbit overlay for OrbitEdit
 // --------------------
+
+struct OrbitGeom {
+    Vec2 bary;      // barycenter
+    double a;       // distance from bary to body (circular orbit radius)
+    Vec2 peWorld;   // periapsis point on orbit
+    Vec2 apWorld;   // apoapsis point on orbit
+};
+
+bool computeOrbitGeom(const Body& body, const Body& parent, OrbitGeom& out) {
+    double Mtot = body.mass + parent.mass;
+    if (Mtot <= 0.0) return false;
+
+    // barycenter
+    out.bary.x = (body.position.x * body.mass + parent.position.x * parent.mass) / Mtot;
+    out.bary.y = (body.position.y * body.mass + parent.position.y * parent.mass) / Mtot;
+
+    Vec2 relBody   = { body.position.x - out.bary.x, body.position.y - out.bary.y };
+    Vec2 relParent = { parent.position.x - out.bary.x, parent.position.y - out.bary.y };
+
+    out.a = length(relBody);
+    if (out.a <= 0.0) return false;
+
+    double distParent = length(relParent);
+    if (distParent <= 0.0) return false;
+
+    Vec2 peDir{ relParent.x / distParent, relParent.y / distParent };
+
+    out.peWorld = { out.bary.x + out.a * peDir.x, out.bary.y + out.a * peDir.y };
+    out.apWorld = { out.bary.x - out.a * peDir.x, out.bary.y - out.a * peDir.y };
+
+    return true;
+}
+
+OrbitHandle pickOrbitHandle(
+    const Body& body,
+    const Body& parent,
+    const sf::Vector2f& mouseScreen,
+    double width,
+    double height
+) {
+    OrbitGeom geom;
+    if (!computeOrbitGeom(body, parent, geom)) return OrbitHandle::None;
+
+    sf::Vector2f peScreen = worldToScreen(geom.peWorld, width, height);
+    sf::Vector2f apScreen = worldToScreen(geom.apWorld, width, height);
+    sf::Vector2f bodyScreen = worldToScreen(body.position, width, height);
+
+    auto dist2 = [](const sf::Vector2f& a, const sf::Vector2f& b) {
+        float dx = a.x - b.x;
+        float dy = a.y - b.y;
+        return dx*dx + dy*dy;
+    };
+
+    const float r2 = 10.0f * 10.0f; // 10px radius
+
+    if (dist2(mouseScreen, bodyScreen) <= r2) return OrbitHandle::Body;
+    if (dist2(mouseScreen, peScreen)   <= r2) return OrbitHandle::Pe;
+    if (dist2(mouseScreen, apScreen)   <= r2) return OrbitHandle::Ap;
+
+    return OrbitHandle::None;
+}
+
 void drawOrbitOverlay(
     sf::RenderWindow& window,
     const Body& body,
@@ -281,49 +348,34 @@ void drawOrbitOverlay(
     double height,
     const sf::Font& font
 ) {
-    // Barycenter (2-body)
-    double Mtot = body.mass + parent.mass;
-    Vec2 bary{
-        (body.position.x * body.mass + parent.position.x * parent.mass) / Mtot,
-        (body.position.y * body.mass + parent.position.y * parent.mass) / Mtot
-    };
+    OrbitGeom geom;
+    if (!computeOrbitGeom(body, parent, geom)) return;
 
-    Vec2 relBody = body.position - bary;
-    Vec2 relParent = parent.position - bary;
-    double a = length(relBody);
-    if (a <= 0.0) return;
-
-    // approximated as circle radius a
+    // orbit circle
     const int SEGMENTS = 256;
     std::vector<sf::Vertex> orbitLine;
     orbitLine.reserve(SEGMENTS + 1);
     for (int i = 0; i <= SEGMENTS; ++i) {
         double t = (double)i / SEGMENTS;
         double ang = t * 2.0 * 3.141592653589793;
-        Vec2 pWorld{ bary.x + a * std::cos(ang), bary.y + a * std::sin(ang) };
+        Vec2 pWorld{ geom.bary.x + geom.a * std::cos(ang),
+                     geom.bary.y + geom.a * std::sin(ang) };
         sf::Vector2f s = worldToScreen(pWorld, width, height);
         orbitLine.emplace_back(s, sf::Color(0, 150, 255)); // blue
     }
     window.draw(orbitLine.data(), orbitLine.size(), sf::LineStrip);
 
-    // barycenter point
-    sf::Vector2f baryScreen = worldToScreen(bary, width, height);
+    // barycenter
+    sf::Vector2f baryScreen = worldToScreen(geom.bary, width, height);
     sf::CircleShape baryPt(4.0f);
     baryPt.setOrigin(4.0f, 4.0f);
     baryPt.setPosition(baryScreen);
     baryPt.setFillColor(sf::Color::Red);
     window.draw(baryPt);
 
-    // Pe direction: from barycenter towards parent
-    double distParent = length(relParent);
-    if (distParent <= 0.0) return;
-    Vec2 peDir{ relParent.x / distParent, relParent.y / distParent };
-
-    Vec2 peWorld{ bary.x + a * peDir.x, bary.y + a * peDir.y };
-    Vec2 apWorld{ bary.x - a * peDir.x, bary.y - a * peDir.y };
-
-    sf::Vector2f peScreen = worldToScreen(peWorld, width, height);
-    sf::Vector2f apScreen = worldToScreen(apWorld, width, height);
+    // Pe / Ap screen
+    sf::Vector2f peScreen = worldToScreen(geom.peWorld, width, height);
+    sf::Vector2f apScreen = worldToScreen(geom.apWorld, width, height);
 
     // dashed lines
     auto drawDashed = [&](const sf::Vector2f& A, const sf::Vector2f& B) {
@@ -369,6 +421,7 @@ void drawOrbitOverlay(
     text.setFont(font);
     text.setCharacterSize(12);
 
+    // Pe / Ap labels (just the tags, no r(Pe)/r(Ap) text to avoid intersections)
     text.setFillColor(sf::Color(255, 100, 200));
     text.setString("Pe");
     text.setPosition(peScreen.x + 6.0f, peScreen.y - 4.0f);
@@ -378,22 +431,11 @@ void drawOrbitOverlay(
     text.setPosition(apScreen.x + 6.0f, apScreen.y - 4.0f);
     window.draw(text);
 
-    // distances (circular, so r(Pe)=r(Ap)=a)
-    text.setFillColor(sf::Color::White);
-    text.setString("r(Pe) = " + formatDistance(a));
-    text.setPosition((baryScreen.x + peScreen.x) * 0.5f + 4.0f,
-                     (baryScreen.y + peScreen.y) * 0.5f);
-    window.draw(text);
-
-    text.setString("r(Ap) = " + formatDistance(a));
-    text.setPosition((baryScreen.x + apScreen.x) * 0.5f + 4.0f,
-                     (baryScreen.y + apScreen.y) * 0.5f + 14.0f);
-    window.draw(text);
-
-    // true anomaly ν (angle from Pe)
-    Vec2 relFromBary = body.position - bary;
+    // True anomaly ν (offset so it doesn't sit right on the body)
+    Vec2 relFromBary{ body.position.x - geom.bary.x, body.position.y - geom.bary.y };
+    Vec2 relParent  { parent.position.x - geom.bary.x, parent.position.y - geom.bary.y };
     double angBody = std::atan2(relFromBary.y, relFromBary.x);
-    double angPe   = std::atan2(peDir.y, peDir.x);
+    double angPe   = std::atan2(relParent.y,  relParent.x);
     double nu = angBody - angPe;
     while (nu < 0.0) nu += 2.0 * 3.141592653589793;
     while (nu >= 2.0 * 3.141592653589793) nu -= 2.0 * 3.141592653589793;
@@ -404,18 +446,72 @@ void drawOrbitOverlay(
     text.setFillColor(sf::Color::Green);
     text.setString(buf);
     sf::Vector2f bodyScreen = worldToScreen(body.position, width, height);
-    text.setPosition(bodyScreen.x + 8.0f, bodyScreen.y - 4.0f);
+    text.setPosition(bodyScreen.x + 8.0f, bodyScreen.y - 20.0f); // lifted up a bit
     window.draw(text);
 
-    // orbital period (Kepler 3rd, 2-body)
-    double T = 2.0 * 3.141592653589793 * std::sqrt(a * a * a / (G_PHYS * (body.mass + parent.mass)));
+    // Orbital period (place under the orbit center)
+    double T = 2.0 * 3.141592653589793 *
+               std::sqrt(geom.a * geom.a * geom.a / (G_PHYS * (body.mass + parent.mass)));
     double T_years = T / YEAR_SECONDS;
     std::snprintf(buf, sizeof(buf), "P = %.3f yr", T_years);
     text.setFillColor(sf::Color(0, 180, 255));
     text.setString(buf);
-    sf::Vector2f labelPos = worldToScreen({bary.x + a, bary.y}, width, height);
-    text.setPosition(labelPos.x + 6.0f, labelPos.y + 4.0f);
+    text.setPosition(baryScreen.x - 40.0f, baryScreen.y + 30.0f);
     window.draw(text);
+}
+
+void applyOrbitDrag(
+    Body& body,
+    const Body& parent,
+    OrbitHandle handle,
+    const Vec2& mouseWorld
+) {
+    OrbitGeom geom;
+    if (!computeOrbitGeom(body, parent, geom)) return;
+
+    // current direction from barycenter to body
+    Vec2 relBody{ body.position.x - geom.bary.x, body.position.y - geom.bary.y };
+    double currentR = length(relBody);
+    if (currentR <= 0.0) return;
+    Vec2 dirBody{ relBody.x / currentR, relBody.y / currentR };
+
+    // vector from barycenter to mouse
+    Vec2 relMouse{ mouseWorld.x - geom.bary.x, mouseWorld.y - geom.bary.y };
+    double mouseR = length(relMouse);
+
+    double newA = geom.a;  // default: keep same radius
+    Vec2   newDir = dirBody; // default: keep same angle
+
+    if (handle == OrbitHandle::Body) {
+        // same radius, new angle
+        if (mouseR > 1.0e6) { // avoid too close
+            newDir = { relMouse.x / mouseR, relMouse.y / mouseR };
+        }
+    } else if (handle == OrbitHandle::Pe || handle == OrbitHandle::Ap) {
+        // change radius, keep angle
+        if (mouseR > 1.0e6) {
+            newA = mouseR;
+        }
+    }
+
+    // update body position on circle
+    body.position.x = geom.bary.x + newDir.x * newA;
+    body.position.y = geom.bary.y + newDir.y * newA;
+
+    // recompute circular velocity relative to parent
+    Vec2 rParent{
+        body.position.x - parent.position.x,
+        body.position.y - parent.position.y
+    };
+    double dist = length(rParent);
+    if (dist < SOFTENING_METERS) dist = SOFTENING_METERS;
+
+    double vmag = std::sqrt(G_PHYS * parent.mass / dist);
+    Vec2 rhat{ rParent.x / dist, rParent.y / dist };
+    Vec2 perp{ -rhat.y, rhat.x };
+
+    body.velocity.x = parent.velocity.x + perp.x * vmag;
+    body.velocity.y = parent.velocity.y + perp.y * vmag;
 }
 
 // scale / time formatting
@@ -608,6 +704,26 @@ int main() {
                     sf::FloatRect panelRect(bodyPanel.pos, bodyPanel.size);
                     sf::FloatRect titleRect(bodyPanel.pos.x, bodyPanel.pos.y, bodyPanel.size.x, 24.0f);
 
+                    if (mode == InteractionMode::OrbitEdit &&
+                        event.mouseButton.button == sf::Mouse::Left &&
+                        orbitEditBodyIndex >= 0 && orbitEditBodyIndex < (int)bodies.size() &&
+                        orbitEditParentIndex >= 0 && orbitEditParentIndex < (int)bodies.size()) {
+
+                        OrbitHandle h = pickOrbitHandle(
+                            bodies[orbitEditBodyIndex],
+                            bodies[orbitEditParentIndex],
+                            mouseScreenF,
+                            WIDTH,
+                            HEIGHT
+                        );
+
+                        if (h != OrbitHandle::None) {
+                            orbitDragHandle = h;
+                            orbitDragging   = true;
+                            continue;
+                        }
+                    }
+
                     if (event.mouseButton.button == sf::Mouse::Left) {
                         if (titleRect.contains(mouseScreenF)) {
                             float btnSize = 16.0f;
@@ -745,6 +861,10 @@ int main() {
                         bodies.push_back(b);
                         computeGravity(bodies);
                     }
+                    if (event.mouseButton.button == sf::Mouse::Left && orbitDragging) {
+                        orbitDragging = false;
+                        orbitDragHandle = OrbitHandle::None;
+                    }
                 }
             }
             // mouse move (for dragging panel)
@@ -753,10 +873,30 @@ int main() {
                     sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
                     bodyPanel.pos = mouseScreenF - bodyPanel.dragOffset;
                 }
-            }
-        } // end pollEvent loop
+                if (orbitDragging &&
+                    mode == InteractionMode::OrbitEdit &&
+                    orbitEditBodyIndex >= 0 && orbitEditBodyIndex < (int)bodies.size() &&
+                    orbitEditParentIndex >= 0 && orbitEditParentIndex < (int)bodies.size()) {
 
-        // --- Update physics ---
+                    sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                    double cx = WIDTH * 0.5;
+                    double cy = HEIGHT * 0.5;
+                    Vec2 mouseWorld{
+                        (mouseScreenF.x - cx) * metersPerPixel + viewCenterWorld.x,
+                        (mouseScreenF.y - cy) * metersPerPixel + viewCenterWorld.y
+                    };
+
+                    applyOrbitDrag(
+                        bodies[orbitEditBodyIndex],
+                        bodies[orbitEditParentIndex],
+                        orbitDragHandle,
+                        mouseWorld
+                    );
+                }
+            }
+        }
+
+        // update phhys
         float dtSeconds = clock.restart().asSeconds();
         if (dtSeconds > 0.05f) dtSeconds = 0.05f;
         double dt = static_cast<double>(dtSeconds);
