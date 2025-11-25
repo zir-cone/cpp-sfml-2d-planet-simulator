@@ -31,6 +31,10 @@ double length(const Vec2& v) {
     return std::sqrt(v.x * v.x + v.y * v.y);
 }
 
+double dot(const Vec2& a, const Vec2& b) {
+    return a.x*b.x + a.y*b.y;
+}
+
 // --------------------
 // Body types
 // --------------------
@@ -70,7 +74,7 @@ struct Body {
 // --------------------
 
 // Physical constants
-const double G_PHYS = 6.67430e-11;          // m^3 kg^-1 s^-2
+const double G_PHYS       = 6.67430e-11;          // m^3 kg^-1 s^-2
 const double YEAR_SECONDS = 365.25 * 24.0 * 3600.0;
 
 const double M_SUN   = 1.98847e30;         // kg
@@ -111,21 +115,20 @@ void updateBodyAfterMassChange(Body& b) {
     }
 }
 
-// simple scientific notation formatter
+// formatting helpers
 std::string formatSci(double v, int prec = 3) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.*e", prec, v);
     return std::string(buf);
 }
 
-// nice distance formatter
 std::string formatDistance(double meters) {
     char buf[64];
     if (meters >= 1.0e12)      std::snprintf(buf, sizeof(buf), "%.3f Tm", meters / 1.0e12);
     else if (meters >= 1.0e9)  std::snprintf(buf, sizeof(buf), "%.3f Gm", meters / 1.0e9);
     else if (meters >= 1.0e6)  std::snprintf(buf, sizeof(buf), "%.3f Mm", meters / 1.0e6);
     else if (meters >= 1.0e3)  std::snprintf(buf, sizeof(buf), "%.3f km", meters / 1.0e3);
-    else                       std::snprintf(buf, sizeof(buf), "%.0f m", meters);
+    else                       std::snprintf(buf, sizeof(buf), "%.0f m",  meters);
     return std::string(buf);
 }
 
@@ -246,11 +249,6 @@ int findStrongestInfluenceParent(const std::vector<Body>& bodies, const Vec2& po
 Vec2 viewCenterWorld{0.0, 0.0};
 int  viewBodyIndex = -1;
 
-// Philippians 4:13
-enum class OrbitHandle { None, Body, Pe, Ap };
-OrbitHandle orbitDragHandle = OrbitHandle::None;
-bool orbitDragging = false;
-
 // world (meters) -> screen (pixels)
 sf::Vector2f worldToScreen(const Vec2& p, double width, double height) {
     double cx = width * 0.5;
@@ -265,6 +263,29 @@ sf::Vector2f worldToScreen(const Vec2& p, double width, double height) {
     return sf::Vector2f(static_cast<float>(x), static_cast<float>(y));
 }
 
+// --------------------
+// orbit editing state
+// --------------------
+enum class OrbitHandle { None, Body, Pe, Ap };
+
+struct OrbitEditState {
+    bool active = false;
+    int  bodyIndex = -1;
+    int  parentIndex = -1;
+
+    double a = 0.0;  // semi-major axis
+    double e = 0.0;  // eccentricity (0..1)
+    double nu = 0.0; // true anomaly (radians)
+
+    Vec2 u{1.0, 0.0}; // unit vector from parent to periapsis
+    Vec2 v{0.0, 1.0}; // perpendicular, CCW from u
+
+    OrbitHandle dragHandle = OrbitHandle::None;
+    bool dragging = false;
+};
+
+OrbitEditState orbitEdit;
+
 // gui panel for sel body
 struct BodyPanel {
     bool visible   = false;
@@ -275,42 +296,120 @@ struct BodyPanel {
     sf::Vector2f dragOffset{0.0f, 0.0f};
 };
 
-// --------------------
-// Orbit overlay for OrbitEdit
-// --------------------
-
-struct OrbitGeom {
-    Vec2 bary;      // barycenter
-    double a;       // distance from bary to body (circular orbit radius)
-    Vec2 peWorld;   // periapsis point on orbit
-    Vec2 apWorld;   // apoapsis point on orbit
+// reset confirmation popup
+struct ResetPopup {
+    bool visible = false;
+    sf::FloatRect yesRect;
+    sf::FloatRect noRect;
 };
 
-bool computeOrbitGeom(const Body& body, const Body& parent, OrbitGeom& out) {
-    double Mtot = body.mass + parent.mass;
-    if (Mtot <= 0.0) return false;
+ResetPopup resetPopup;
 
-    // barycenter
-    out.bary.x = (body.position.x * body.mass + parent.position.x * parent.mass) / Mtot;
-    out.bary.y = (body.position.y * body.mass + parent.position.y * parent.mass) / Mtot;
+// --------------------
+// orbit helper functions
+// --------------------
+void normalize(Vec2& v) {
+    double len = length(v);
+    if (len > 0.0) {
+        v.x /= len;
+        v.y /= len;
+    }
+}
 
-    Vec2 relBody   = { body.position.x - out.bary.x, body.position.y - out.bary.y };
-    Vec2 relParent = { parent.position.x - out.bary.x, parent.position.y - out.bary.y };
+// update body.position & velocity from orbitEdit (around parent)
+void updateBodyFromOrbit(Body& body, const Body& parent) {
+    double a = orbitEdit.a;
+    double e = orbitEdit.e;
+    double nu = orbitEdit.nu;
 
-    out.a = length(relBody);
-    if (out.a <= 0.0) return false;
+    double cosnu = std::cos(nu);
+    double sinnu = std::sin(nu);
 
-    double distParent = length(relParent);
-    if (distParent <= 0.0) return false;
+    double denom = 1.0 + e * cosnu;
+    if (denom <= 0.0) denom = 1e-6;
+    double r = a * (1.0 - e * e) / denom;
 
-    Vec2 peDir{ relParent.x / distParent, relParent.y / distParent };
+    Vec2 rel = orbitEdit.u * (r * cosnu) + orbitEdit.v * (r * sinnu);
+    body.position = { parent.position.x + rel.x, parent.position.y + rel.y };
 
-    out.peWorld = { out.bary.x + out.a * peDir.x, out.bary.y + out.a * peDir.y };
-    out.apWorld = { out.bary.x - out.a * peDir.x, out.bary.y - out.a * peDir.y };
+    // vis-viva velocity magnitude
+    double mu = G_PHYS * (body.mass + parent.mass);
+    double vmag = std::sqrt(std::max(0.0, mu * (2.0 / r - 1.0 / a)));
 
+    Vec2 rhat = rel;
+    normalize(rhat);
+    Vec2 that{ -rhat.y, rhat.x }; // CCW tangent
+
+    body.velocity = { parent.velocity.x + that.x * vmag,
+                      parent.velocity.y + that.y * vmag };
+}
+
+// compute Pe & Ap radii
+double getRpe() {
+    return orbitEdit.a * (1.0 - orbitEdit.e);
+}
+double getRap() {
+    return orbitEdit.a * (1.0 + orbitEdit.e);
+}
+
+// init orbitEdit from current body & parent (start circular orbit)
+void initOrbitEdit(int bodyIdx, int parentIdx, std::vector<Body>& bodies) {
+    orbitEdit.active = true;
+    orbitEdit.bodyIndex = bodyIdx;
+    orbitEdit.parentIndex = parentIdx;
+    orbitEdit.dragHandle = OrbitHandle::None;
+    orbitEdit.dragging = false;
+
+    Body& body = bodies[bodyIdx];
+    Body& parent = bodies[parentIdx];
+
+    Vec2 rel{ body.position.x - parent.position.x,
+              body.position.y - parent.position.y };
+    double r = length(rel);
+    if (r < SOFTENING_METERS) r = SOFTENING_METERS;
+
+    orbitEdit.a = r;
+    orbitEdit.e = 0.0;
+    orbitEdit.nu = 0.0;
+
+    orbitEdit.u = rel;
+    normalize(orbitEdit.u);
+    orbitEdit.v = { -orbitEdit.u.y, orbitEdit.u.x };
+
+    updateBodyFromOrbit(body, parent);
+}
+
+// orbit geometry for overlay & hit-testing
+struct OrbitGeom {
+    Vec2 parentPos;
+    double a;
+    double e;
+    Vec2 u;
+    Vec2 v;
+    Vec2 peWorld;
+    Vec2 apWorld;
+};
+
+bool computeOrbitGeom(const Body& parent, OrbitGeom& out) {
+    if (!orbitEdit.active) return false;
+    out.parentPos = parent.position;
+    out.a = orbitEdit.a;
+    out.e = orbitEdit.e;
+    out.u = orbitEdit.u;
+    out.v = orbitEdit.v;
+
+    double r_pe = getRpe();
+    double r_ap = getRap();
+    if (r_pe <= 0.0 || r_ap <= 0.0) return false;
+
+    out.peWorld = { parent.position.x + out.u.x * r_pe,
+                    parent.position.y + out.u.y * r_pe };
+    out.apWorld = { parent.position.x - out.u.x * r_ap,
+                    parent.position.y - out.u.y * r_ap };
     return true;
 }
 
+// which overlay handle is near mouse?
 OrbitHandle pickOrbitHandle(
     const Body& body,
     const Body& parent,
@@ -319,7 +418,7 @@ OrbitHandle pickOrbitHandle(
     double height
 ) {
     OrbitGeom geom;
-    if (!computeOrbitGeom(body, parent, geom)) return OrbitHandle::None;
+    if (!computeOrbitGeom(parent, geom)) return OrbitHandle::None;
 
     sf::Vector2f peScreen = worldToScreen(geom.peWorld, width, height);
     sf::Vector2f apScreen = worldToScreen(geom.apWorld, width, height);
@@ -331,7 +430,7 @@ OrbitHandle pickOrbitHandle(
         return dx*dx + dy*dy;
     };
 
-    const float r2 = 10.0f * 10.0f; // 10px radius
+    const float r2 = 10.0f * 10.0f;
 
     if (dist2(mouseScreen, bodyScreen) <= r2) return OrbitHandle::Body;
     if (dist2(mouseScreen, peScreen)   <= r2) return OrbitHandle::Pe;
@@ -340,6 +439,89 @@ OrbitHandle pickOrbitHandle(
     return OrbitHandle::None;
 }
 
+// apply dragging to orbit parameters
+void applyOrbitDrag(
+    Body& body,
+    Body& parent,
+    const Vec2& mouseWorld
+) {
+    if (!orbitEdit.active) return;
+
+    Vec2 relMouse{
+        mouseWorld.x - parent.position.x,
+        mouseWorld.y - parent.position.y
+    };
+    double r_mouse = length(relMouse);
+    if (r_mouse < 1.0e6) return;
+
+    // Coordinates of relMouse in (u,v) basis
+    double c = dot(relMouse, orbitEdit.u) / r_mouse;
+    double s = dot(relMouse, orbitEdit.v) / r_mouse;
+    double angleMouse = std::atan2(s, c);
+
+    double r_pe_old = getRpe();
+    double r_ap_old = getRap();
+
+    if (orbitEdit.dragHandle == OrbitHandle::Body) {
+        // move along ellipse (change ν, keep a,e)
+        orbitEdit.nu = angleMouse;
+    }
+    else if (orbitEdit.dragHandle == OrbitHandle::Pe ||
+             orbitEdit.dragHandle == OrbitHandle::Ap) {
+
+        // new orientation: direction of mouse from parent
+        orbitEdit.u = relMouse;
+        normalize(orbitEdit.u);
+        orbitEdit.v = { -orbitEdit.u.y, orbitEdit.u.x };
+
+        double r_pe_new = r_pe_old;
+        double r_ap_new = r_ap_old;
+
+        if (orbitEdit.dragHandle == OrbitHandle::Pe) {
+            // user intends to drag Pe distance
+            r_pe_new = r_mouse;
+
+            if (r_pe_new > r_ap_old) {
+                // swap roles: mouse point is now Ap
+                std::swap(r_pe_new, r_ap_old);
+                orbitEdit.dragHandle = OrbitHandle::Ap;
+                // orientation u points to new Pe, which is opposite current mouse direction:
+                orbitEdit.u.x = -orbitEdit.u.x;
+                orbitEdit.u.y = -orbitEdit.u.y;
+                orbitEdit.v = { -orbitEdit.u.y, orbitEdit.u.x };
+            }
+        } else {
+            // dragging Ap
+            r_ap_new = r_mouse;
+
+            if (r_ap_new < r_pe_old) {
+                // swap roles: mouse point is now Pe
+                std::swap(r_ap_new, r_pe_old);
+                orbitEdit.dragHandle = OrbitHandle::Pe;
+                // orientation u points toward new Pe (mouse direction)
+                // (already set above)
+            }
+        }
+
+        // recompute a,e from r_pe,r_ap
+        r_pe_new = std::max(r_pe_new, 1.0e6);
+        r_ap_new = std::max(r_ap_new, r_pe_new + 1.0e6);
+
+        orbitEdit.a = 0.5 * (r_pe_new + r_ap_new);
+        orbitEdit.e = (r_ap_new - r_pe_new) / (r_ap_new + r_pe_new);
+        if (orbitEdit.e < 0.0) orbitEdit.e = 0.0;
+        if (orbitEdit.e > 0.99) orbitEdit.e = 0.99;
+
+        // keep ν as angleMouse (body stays roughly where it is angle-wise)
+        orbitEdit.nu = angleMouse;
+    }
+
+    updateBodyFromOrbit(body, parent);
+}
+
+// --------------------
+// drawing orbit overlay
+// --------------------
 void drawOrbitOverlay(
     sf::RenderWindow& window,
     const Body& body,
@@ -348,36 +530,56 @@ void drawOrbitOverlay(
     double height,
     const sf::Font& font
 ) {
-    OrbitGeom geom;
-    if (!computeOrbitGeom(body, parent, geom)) return;
+    if (!orbitEdit.active) return;
 
-    // orbit circle
+    OrbitGeom geom;
+    if (!computeOrbitGeom(parent, geom)) return;
+
+    // ellipse samples
     const int SEGMENTS = 256;
     std::vector<sf::Vertex> orbitLine;
     orbitLine.reserve(SEGMENTS + 1);
+
     for (int i = 0; i <= SEGMENTS; ++i) {
-        double t = (double)i / SEGMENTS;
-        double ang = t * 2.0 * 3.141592653589793;
-        Vec2 pWorld{ geom.bary.x + geom.a * std::cos(ang),
-                     geom.bary.y + geom.a * std::sin(ang) };
+        double theta = (double)i / SEGMENTS * 2.0 * 3.141592653589793;
+        double cosT = std::cos(theta);
+        double sinT = std::sin(theta);
+        double denom = 1.0 + geom.e * cosT;
+        if (denom <= 0.0) denom = 1e-6;
+        double r = geom.a * (1.0 - geom.e * geom.e) / denom;
+
+        Vec2 rel = geom.u * (r * cosT) + geom.v * (r * sinT);
+        Vec2 pWorld{ geom.parentPos.x + rel.x, geom.parentPos.y + rel.y };
         sf::Vector2f s = worldToScreen(pWorld, width, height);
-        orbitLine.emplace_back(s, sf::Color(0, 150, 255)); // blue
+        orbitLine.emplace_back(s, sf::Color(0, 150, 255));
     }
     window.draw(orbitLine.data(), orbitLine.size(), sf::LineStrip);
 
-    // barycenter
-    sf::Vector2f baryScreen = worldToScreen(geom.bary, width, height);
-    sf::CircleShape baryPt(4.0f);
-    baryPt.setOrigin(4.0f, 4.0f);
-    baryPt.setPosition(baryScreen);
-    baryPt.setFillColor(sf::Color::Red);
-    window.draw(baryPt);
+    // parent (central focus)
+    sf::Vector2f parentScreen = worldToScreen(geom.parentPos, width, height);
+    sf::CircleShape parentPt(4.0f);
+    parentPt.setOrigin(4.0f, 4.0f);
+    parentPt.setPosition(parentScreen);
+    parentPt.setFillColor(sf::Color::Red);
+    window.draw(parentPt);
 
-    // Pe / Ap screen
+    // Pe / Ap points
     sf::Vector2f peScreen = worldToScreen(geom.peWorld, width, height);
     sf::Vector2f apScreen = worldToScreen(geom.apWorld, width, height);
 
-    // dashed lines
+    sf::CircleShape pePt(4.0f);
+    pePt.setOrigin(4.0f, 4.0f);
+    pePt.setPosition(peScreen);
+    pePt.setFillColor(sf::Color(255, 100, 200));
+    window.draw(pePt);
+
+    sf::CircleShape apPt(4.0f);
+    apPt.setOrigin(4.0f, 4.0f);
+    apPt.setPosition(apScreen);
+    apPt.setFillColor(sf::Color(255, 100, 200));
+    window.draw(apPt);
+
+    // dashed lines parent->Pe/Ap
     auto drawDashed = [&](const sf::Vector2f& A, const sf::Vector2f& B) {
         const float dashLen = 8.0f;
         const float gapLen  = 4.0f;
@@ -399,21 +601,8 @@ void drawOrbitOverlay(
         }
     };
 
-    drawDashed(baryScreen, peScreen);
-    drawDashed(baryScreen, apScreen);
-
-    // Pe / Ap markers
-    sf::CircleShape pePt(4.0f);
-    pePt.setOrigin(4.0f, 4.0f);
-    pePt.setPosition(peScreen);
-    pePt.setFillColor(sf::Color(255, 100, 200));
-    window.draw(pePt);
-
-    sf::CircleShape apPt(4.0f);
-    apPt.setOrigin(4.0f, 4.0f);
-    apPt.setPosition(apScreen);
-    apPt.setFillColor(sf::Color(255, 100, 200));
-    window.draw(apPt);
+    drawDashed(parentScreen, peScreen);
+    drawDashed(parentScreen, apScreen);
 
     if (font.getInfo().family.empty()) return;
 
@@ -421,7 +610,7 @@ void drawOrbitOverlay(
     text.setFont(font);
     text.setCharacterSize(12);
 
-    // Pe / Ap labels (just the tags, no r(Pe)/r(Ap) text to avoid intersections)
+    // Pe / Ap labels
     text.setFillColor(sf::Color(255, 100, 200));
     text.setString("Pe");
     text.setPosition(peScreen.x + 6.0f, peScreen.y - 4.0f);
@@ -431,87 +620,34 @@ void drawOrbitOverlay(
     text.setPosition(apScreen.x + 6.0f, apScreen.y - 4.0f);
     window.draw(text);
 
-    // True anomaly ν (offset so it doesn't sit right on the body)
-    Vec2 relFromBary{ body.position.x - geom.bary.x, body.position.y - geom.bary.y };
-    Vec2 relParent  { parent.position.x - geom.bary.x, parent.position.y - geom.bary.y };
-    double angBody = std::atan2(relFromBary.y, relFromBary.x);
-    double angPe   = std::atan2(relParent.y,  relParent.x);
-    double nu = angBody - angPe;
-    while (nu < 0.0) nu += 2.0 * 3.141592653589793;
-    while (nu >= 2.0 * 3.141592653589793) nu -= 2.0 * 3.141592653589793;
-    double nuDeg = nu * 180.0 / 3.141592653589793;
+    // true anomaly ν and period
+    Vec2 relBody{ body.position.x - geom.parentPos.x,
+                  body.position.y - geom.parentPos.y };
+    double r = length(relBody);
+    if (r <= 0.0) r = 1.0;
+
+    Vec2 rhat = relBody;
+    normalize(rhat);
+    double c = dot(rhat, geom.u);
+    double s = dot(rhat, geom.v);
+    double nuDeg = std::atan2(s, c) * 180.0 / 3.141592653589793;
 
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "ν = %.2f°", nuDeg);
-    text.setFillColor(sf::Color::Green);
-    text.setString(buf);
     sf::Vector2f bodyScreen = worldToScreen(body.position, width, height);
-    text.setPosition(bodyScreen.x + 8.0f, bodyScreen.y - 20.0f); // lifted up a bit
-    window.draw(text);
-
-    // Orbital period (place under the orbit center)
-    double T = 2.0 * 3.141592653589793 *
-               std::sqrt(geom.a * geom.a * geom.a / (G_PHYS * (body.mass + parent.mass)));
-    double T_years = T / YEAR_SECONDS;
-    std::snprintf(buf, sizeof(buf), "P = %.3f yr", T_years);
-    text.setFillColor(sf::Color(0, 180, 255));
+    text.setFillColor(sf::Color::Green);
+    std::snprintf(buf, sizeof(buf), "ν = %.2f°", nuDeg);
     text.setString(buf);
-    text.setPosition(baryScreen.x - 40.0f, baryScreen.y + 30.0f);
+    text.setPosition(bodyScreen.x + 8.0f, bodyScreen.y - 20.0f);
     window.draw(text);
-}
 
-void applyOrbitDrag(
-    Body& body,
-    const Body& parent,
-    OrbitHandle handle,
-    const Vec2& mouseWorld
-) {
-    OrbitGeom geom;
-    if (!computeOrbitGeom(body, parent, geom)) return;
-
-    // current direction from barycenter to body
-    Vec2 relBody{ body.position.x - geom.bary.x, body.position.y - geom.bary.y };
-    double currentR = length(relBody);
-    if (currentR <= 0.0) return;
-    Vec2 dirBody{ relBody.x / currentR, relBody.y / currentR };
-
-    // vector from barycenter to mouse
-    Vec2 relMouse{ mouseWorld.x - geom.bary.x, mouseWorld.y - geom.bary.y };
-    double mouseR = length(relMouse);
-
-    double newA = geom.a;  // default: keep same radius
-    Vec2   newDir = dirBody; // default: keep same angle
-
-    if (handle == OrbitHandle::Body) {
-        // same radius, new angle
-        if (mouseR > 1.0e6) { // avoid too close
-            newDir = { relMouse.x / mouseR, relMouse.y / mouseR };
-        }
-    } else if (handle == OrbitHandle::Pe || handle == OrbitHandle::Ap) {
-        // change radius, keep angle
-        if (mouseR > 1.0e6) {
-            newA = mouseR;
-        }
-    }
-
-    // update body position on circle
-    body.position.x = geom.bary.x + newDir.x * newA;
-    body.position.y = geom.bary.y + newDir.y * newA;
-
-    // recompute circular velocity relative to parent
-    Vec2 rParent{
-        body.position.x - parent.position.x,
-        body.position.y - parent.position.y
-    };
-    double dist = length(rParent);
-    if (dist < SOFTENING_METERS) dist = SOFTENING_METERS;
-
-    double vmag = std::sqrt(G_PHYS * parent.mass / dist);
-    Vec2 rhat{ rParent.x / dist, rParent.y / dist };
-    Vec2 perp{ -rhat.y, rhat.x };
-
-    body.velocity.x = parent.velocity.x + perp.x * vmag;
-    body.velocity.y = parent.velocity.y + perp.y * vmag;
+    double mu = G_PHYS * (body.mass + parent.mass);
+    double T = 2.0 * 3.141592653589793 * std::sqrt(geom.a * geom.a * geom.a / mu);
+    double T_years = T / YEAR_SECONDS;
+    text.setFillColor(sf::Color(0, 180, 255));
+    std::snprintf(buf, sizeof(buf), "P = %.3f yr", T_years);
+    text.setString(buf);
+    text.setPosition(parentScreen.x - 40.0f, parentScreen.y + 30.0f);
+    window.draw(text);
 }
 
 // scale / time formatting
@@ -525,6 +661,27 @@ std::string formatTimeScaleStr() {
     return std::string(buf);
 }
 
+// --------------------
+// reset system helper
+// --------------------
+void resetSystem(std::vector<Body>& bodies, Body& star) {
+    bodies.clear();
+    star.position = {0.0, 0.0};
+    star.velocity = {0.0, 0.0};
+    star.fixed    = true;
+    bodies.push_back(star);
+    computeGravity(bodies);
+    for (auto& b : bodies) b.trail.clear();
+    orbitEdit.active = false;
+    orbitEdit.dragging = false;
+    orbitEdit.bodyIndex = orbitEdit.parentIndex = -1;
+    viewBodyIndex = -1;
+    viewCenterWorld = star.position;
+}
+
+// --------------------
+// main
+// --------------------
 int main() {
     const unsigned int WIDTH  = 1280;
     const unsigned int HEIGHT = 720;
@@ -563,10 +720,6 @@ int main() {
     bool renaming = false;
     std::string renameBuffer;
 
-    // orbit edit state
-    int orbitEditBodyIndex   = -1;
-    int orbitEditParentIndex = -1;
-
     // view centered on star
     viewCenterWorld = star.position;
 
@@ -578,108 +731,111 @@ int main() {
                 window.close();
             }
             else if (event.type == sf::Event::KeyPressed) {
-                // global hotkeys
-                if (event.key.code == sf::Keyboard::Num1) {
-                    mode = InteractionMode::AddStill;
-                } else if (event.key.code == sf::Keyboard::Num2) {
-                    mode = InteractionMode::AddMoving;
-                } else if (event.key.code == sf::Keyboard::Num3) {
-                    mode = InteractionMode::AddOrbitingPlace;
-                } else if (event.key.code == sf::Keyboard::Delete) {
-                    if (selectedIndex >= 0 && selectedIndex < (int)bodies.size()) {
-                        bodies.erase(bodies.begin() + selectedIndex);
+                // Reset popup (Ctrl+R)
+                if (event.key.code == sf::Keyboard::R && event.key.control) {
+                    resetPopup.visible = true;
+                }
+                // cancel popup / orbit edit / rename via Esc
+                else if (event.key.code == sf::Keyboard::Escape) {
+                    if (resetPopup.visible) {
+                        resetPopup.visible = false;
+                    } else if (renaming) {
+                        renaming = false;
+                    } else if (mode == InteractionMode::OrbitEdit &&
+                               orbitEdit.active &&
+                               orbitEdit.bodyIndex >= 0 &&
+                               orbitEdit.bodyIndex < (int)bodies.size()) {
+                        // cancel ghost
+                        bodies.erase(bodies.begin() + orbitEdit.bodyIndex);
                         selectedIndex = -1;
                         bodyPanel.visible = false;
+                        orbitEdit.active = false;
+                        orbitEdit.dragging = false;
                         computeGravity(bodies);
+                        mode = InteractionMode::AddOrbitingPlace;
                     }
-                } else if (event.key.code == sf::Keyboard::Up) {
-                    if (selectedIndex >= 0) {
-                        bodies[selectedIndex].mass *= 1.2;
-                        updateBodyAfterMassChange(bodies[selectedIndex]);
+                }
+                // orbit commit
+                else if (event.key.code == sf::Keyboard::Enter ||
+                         event.key.code == sf::Keyboard::Return) {
+                    if (mode == InteractionMode::OrbitEdit &&
+                        orbitEdit.active &&
+                        orbitEdit.bodyIndex >= 0 &&
+                        orbitEdit.bodyIndex < (int)bodies.size()) {
+                        bodies[orbitEdit.bodyIndex].ghost = false;
+                        computeGravity(bodies);
+                        orbitEdit.active = false;
+                        orbitEdit.dragging = false;
+                        mode = InteractionMode::AddOrbitingPlace;
                     }
-                } else if (event.key.code == sf::Keyboard::Down) {
-                    if (selectedIndex >= 0) {
-                        bodies[selectedIndex].mass *= 0.8;
-                        updateBodyAfterMassChange(bodies[selectedIndex]);
-                    }
-                } else if (event.key.code == sf::Keyboard::Space && !renaming) {
-                    // reset system
-                    bodies.clear();
-                    star.position = {0.0, 0.0};
-                    star.velocity = {0.0, 0.0};
-                    star.fixed    = true;
-                    bodies.push_back(star);
-                    computeGravity(bodies);
-                    selectedIndex = -1;
-                    bodyPanel.visible = false;
-                    viewBodyIndex = -1;
-                    viewCenterWorld = star.position;
-                    for (auto& b : bodies) b.trail.clear();
-                    orbitEditBodyIndex = orbitEditParentIndex = -1;
-                    mode = InteractionMode::AddStill;
-                } else if (event.key.code == sf::Keyboard::T) {
-                    trailsEnabled = !trailsEnabled;
-                } else if (event.key.code == sf::Keyboard::LBracket) {
-                    if (maxTrailPoints > 10) maxTrailPoints -= 10;
-                } else if (event.key.code == sf::Keyboard::RBracket) {
-                    maxTrailPoints += 10;
-                } else if (event.key.code == sf::Keyboard::V) {
-                    lockVolume = !lockVolume;
-                } else if (event.key.code == sf::Keyboard::F) {
-                    if (selectedIndex >= 0) {
-                        if (viewBodyIndex == selectedIndex) {
-                            viewBodyIndex = -1;
-                        } else {
-                            viewBodyIndex = selectedIndex;
+                }
+                // other hotkeys only if popup not visible
+                else if (!resetPopup.visible) {
+                    if (event.key.code == sf::Keyboard::Num1) {
+                        mode = InteractionMode::AddStill;
+                    } else if (event.key.code == sf::Keyboard::Num2) {
+                        mode = InteractionMode::AddMoving;
+                    } else if (event.key.code == sf::Keyboard::Num3) {
+                        mode = InteractionMode::AddOrbitingPlace;
+                    } else if (event.key.code == sf::Keyboard::Delete) {
+                        if (selectedIndex >= 0 && selectedIndex < (int)bodies.size()) {
+                            bodies.erase(bodies.begin() + selectedIndex);
+                            selectedIndex = -1;
+                            bodyPanel.visible = false;
+                            computeGravity(bodies);
+                        }
+                    } else if (event.key.code == sf::Keyboard::Up) {
+                        if (selectedIndex >= 0) {
+                            bodies[selectedIndex].mass *= 1.2;
+                            updateBodyAfterMassChange(bodies[selectedIndex]);
+                        }
+                    } else if (event.key.code == sf::Keyboard::Down) {
+                        if (selectedIndex >= 0) {
+                            bodies[selectedIndex].mass *= 0.8;
+                            updateBodyAfterMassChange(bodies[selectedIndex]);
+                        }
+                    } else if (event.key.code == sf::Keyboard::T) {
+                        trailsEnabled = !trailsEnabled;
+                    } else if (event.key.code == sf::Keyboard::LBracket) {
+                        if (maxTrailPoints > 10) maxTrailPoints -= 10;
+                    } else if (event.key.code == sf::Keyboard::RBracket) {
+                        maxTrailPoints += 10;
+                    } else if (event.key.code == sf::Keyboard::V) {
+                        lockVolume = !lockVolume;
+                    } else if (event.key.code == sf::Keyboard::F) {
+                        if (selectedIndex >= 0) {
+                            if (viewBodyIndex == selectedIndex) {
+                                viewBodyIndex = -1;
+                            } else {
+                                viewBodyIndex = selectedIndex;
+                            }
+                        }
+                    } else if (event.key.code == sf::Keyboard::X) {
+                        if (selectedIndex >= 0) {
+                            bodies[selectedIndex].fixed = !bodies[selectedIndex].fixed;
+                        }
+                    } else if (event.key.code == sf::Keyboard::F2) {
+                        if (selectedIndex >= 0) {
+                            renaming = true;
+                            renameBuffer = bodies[selectedIndex].name;
                         }
                     }
-                } else if (event.key.code == sf::Keyboard::X) {
-                    if (selectedIndex >= 0) {
-                        bodies[selectedIndex].fixed = !bodies[selectedIndex].fixed;
+                    // zoom I/O
+                    else if (event.key.code == sf::Keyboard::I) { // zoom in
+                        metersPerPixel *= 0.5;
+                        if (metersPerPixel < 1.0e7) metersPerPixel = 1.0e7;
+                    } else if (event.key.code == sf::Keyboard::O) { // zoom out
+                        metersPerPixel *= 2.0;
+                        if (metersPerPixel > 1.0e12) metersPerPixel = 1.0e12;
                     }
-                } else if (event.key.code == sf::Keyboard::F2) {
-                    if (selectedIndex >= 0) {
-                        renaming = true;
-                        renameBuffer = bodies[selectedIndex].name;
+                    // time scale , / .
+                    else if (event.key.code == sf::Keyboard::Comma) {
+                        timeScale *= 0.5;
+                        if (timeScale < 3600.0) timeScale = 3600.0;
+                    } else if (event.key.code == sf::Keyboard::Period) {
+                        timeScale *= 2.0;
+                        if (timeScale > 1.0e7) timeScale = 1.0e7;
                     }
-                } else if (event.key.code == sf::Keyboard::Escape) {
-                    // cancel rename OR orbit edit
-                    if (renaming) renaming = false;
-                    if (mode == InteractionMode::OrbitEdit &&
-                        orbitEditBodyIndex >= 0 &&
-                        orbitEditBodyIndex < (int)bodies.size()) {
-                        bodies.erase(bodies.begin() + orbitEditBodyIndex);
-                        selectedIndex = -1;
-                        bodyPanel.visible = false;
-                        orbitEditBodyIndex = orbitEditParentIndex = -1;
-                        mode = InteractionMode::AddOrbitingPlace;
-                        computeGravity(bodies);
-                    }
-                }
-                // zoom + time scale adjustments
-                else if (event.key.code == sf::Keyboard::I) { // zoom in
-                    metersPerPixel *= 0.5;
-                    if (metersPerPixel < 1.0e7) metersPerPixel = 1.0e7;
-                } else if (event.key.code == sf::Keyboard::O) { // zoom out
-                    metersPerPixel *= 2.0;
-                    if (metersPerPixel > 1.0e12) metersPerPixel = 1.0e12;
-                } else if (event.key.code == sf::Keyboard::Comma) { // slower time
-                    timeScale *= 0.5;
-                    if (timeScale < 3600.0) timeScale = 3600.0; // >= 1 hr/s
-                } else if (event.key.code == sf::Keyboard::Period) { // faster time
-                    timeScale *= 2.0;
-                    if (timeScale > 1.0e7) timeScale = 1.0e7;
-                }
-
-                // OrbitEdit commit
-                if (mode == InteractionMode::OrbitEdit &&
-                    (event.key.code == sf::Keyboard::Enter || event.key.code == sf::Keyboard::Return)) {
-                    if (orbitEditBodyIndex >= 0 && orbitEditBodyIndex < (int)bodies.size()) {
-                        bodies[orbitEditBodyIndex].ghost = false;
-                        computeGravity(bodies);
-                    }
-                    mode = InteractionMode::AddOrbitingPlace;
-                    orbitEditBodyIndex = orbitEditParentIndex = -1;
                 }
             }
             // text input for renaming
@@ -699,30 +855,21 @@ int main() {
             else if (event.type == sf::Event::MouseButtonPressed) {
                 sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
 
+                // reset popup click
+                if (resetPopup.visible && event.mouseButton.button == sf::Mouse::Left) {
+                    if (resetPopup.yesRect.contains(mouseScreenF)) {
+                        resetPopup.visible = false;
+                        resetSystem(bodies, star);
+                    } else if (resetPopup.noRect.contains(mouseScreenF)) {
+                        resetPopup.visible = false;
+                    }
+                    continue;
+                }
+
                 // panel first
                 if (bodyPanel.visible) {
                     sf::FloatRect panelRect(bodyPanel.pos, bodyPanel.size);
                     sf::FloatRect titleRect(bodyPanel.pos.x, bodyPanel.pos.y, bodyPanel.size.x, 24.0f);
-
-                    if (mode == InteractionMode::OrbitEdit &&
-                        event.mouseButton.button == sf::Mouse::Left &&
-                        orbitEditBodyIndex >= 0 && orbitEditBodyIndex < (int)bodies.size() &&
-                        orbitEditParentIndex >= 0 && orbitEditParentIndex < (int)bodies.size()) {
-
-                        OrbitHandle h = pickOrbitHandle(
-                            bodies[orbitEditBodyIndex],
-                            bodies[orbitEditParentIndex],
-                            mouseScreenF,
-                            WIDTH,
-                            HEIGHT
-                        );
-
-                        if (h != OrbitHandle::None) {
-                            orbitDragHandle = h;
-                            orbitDragging   = true;
-                            continue;
-                        }
-                    }
 
                     if (event.mouseButton.button == sf::Mouse::Left) {
                         if (titleRect.contains(mouseScreenF)) {
@@ -763,6 +910,27 @@ int main() {
                     (mouseScreenF.y - cy) * metersPerPixel + viewCenterWorld.y
                 };
 
+                // OrbitEdit handle picking
+                if (mode == InteractionMode::OrbitEdit &&
+                    event.mouseButton.button == sf::Mouse::Left &&
+                    orbitEdit.active &&
+                    orbitEdit.bodyIndex >= 0 && orbitEdit.bodyIndex < (int)bodies.size() &&
+                    orbitEdit.parentIndex >= 0 && orbitEdit.parentIndex < (int)bodies.size()) {
+
+                    OrbitHandle h = pickOrbitHandle(
+                        bodies[orbitEdit.bodyIndex],
+                        bodies[orbitEdit.parentIndex],
+                        mouseScreenF,
+                        WIDTH,
+                        HEIGHT
+                    );
+                    if (h != OrbitHandle::None) {
+                        orbitEdit.dragHandle = h;
+                        orbitEdit.dragging = true;
+                        continue;
+                    }
+                }
+
                 if (event.mouseButton.button == sf::Mouse::Left) {
                     if (mode == InteractionMode::AddStill) {
                         Body b;
@@ -797,24 +965,27 @@ int main() {
                             b.ghost    = true;
 
                             Body& parent = bodies[parentIdx];
-                            Vec2 r = b.position - parent.position;
+                            // initial circular guess
+                            Vec2 r = { worldPos.x - parent.position.x,
+                                       worldPos.y - parent.position.y };
                             double dist = length(r);
                             if (dist < SOFTENING_METERS) dist = SOFTENING_METERS;
 
                             double vmag = std::sqrt(G_PHYS * parent.mass / dist);
-                            Vec2 rhat{ r.x / dist, r.y / dist };
+                            Vec2 rhat = r;
+                            normalize(rhat);
                             Vec2 perp{ -rhat.y, rhat.x };
-                            Vec2 vOrb = perp * vmag;
-
-                            b.velocity = parent.velocity + vOrb;
+                            b.velocity = { parent.velocity.x + perp.x * vmag,
+                                           parent.velocity.y + perp.y * vmag };
 
                             bodies.push_back(b);
-                            orbitEditBodyIndex   = (int)bodies.size() - 1;
-                            orbitEditParentIndex = parentIdx;
-                            selectedIndex        = orbitEditBodyIndex;
-                            bodyPanel.visible    = true;
-                            bodyPanel.minimized  = false;
-                            computeGravity(bodies); // ghosts ignored anyway
+                            int bodyIdx = (int)bodies.size() - 1;
+
+                            initOrbitEdit(bodyIdx, parentIdx, bodies);
+                            selectedIndex = bodyIdx;
+                            bodyPanel.visible = true;
+                            bodyPanel.minimized = false;
+                            computeGravity(bodies); // ghost ignored anyway
                             mode = InteractionMode::OrbitEdit;
                         }
                     }
@@ -834,6 +1005,10 @@ int main() {
                 if (event.mouseButton.button == sf::Mouse::Left) {
                     if (bodyPanel.dragging) {
                         bodyPanel.dragging = false;
+                    }
+                    if (orbitEdit.dragging) {
+                        orbitEdit.dragging = false;
+                        orbitEdit.dragHandle = OrbitHandle::None;
                     }
                     if (mode == InteractionMode::AddMoving && isDraggingAddMoving) {
                         isDraggingAddMoving = false;
@@ -861,22 +1036,19 @@ int main() {
                         bodies.push_back(b);
                         computeGravity(bodies);
                     }
-                    if (event.mouseButton.button == sf::Mouse::Left && orbitDragging) {
-                        orbitDragging = false;
-                        orbitDragHandle = OrbitHandle::None;
-                    }
                 }
             }
-            // mouse move (for dragging panel)
+            // mouse move (panel + orbit drag)
             else if (event.type == sf::Event::MouseMoved) {
                 if (bodyPanel.dragging) {
                     sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
                     bodyPanel.pos = mouseScreenF - bodyPanel.dragOffset;
                 }
-                if (orbitDragging &&
-                    mode == InteractionMode::OrbitEdit &&
-                    orbitEditBodyIndex >= 0 && orbitEditBodyIndex < (int)bodies.size() &&
-                    orbitEditParentIndex >= 0 && orbitEditParentIndex < (int)bodies.size()) {
+
+                if (orbitEdit.dragging &&
+                    orbitEdit.active &&
+                    orbitEdit.bodyIndex >= 0 && orbitEdit.bodyIndex < (int)bodies.size() &&
+                    orbitEdit.parentIndex >= 0 && orbitEdit.parentIndex < (int)bodies.size()) {
 
                     sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
                     double cx = WIDTH * 0.5;
@@ -887,16 +1059,15 @@ int main() {
                     };
 
                     applyOrbitDrag(
-                        bodies[orbitEditBodyIndex],
-                        bodies[orbitEditParentIndex],
-                        orbitDragHandle,
+                        bodies[orbitEdit.bodyIndex],
+                        bodies[orbitEdit.parentIndex],
                         mouseWorld
                     );
                 }
             }
-        }
+        } // end pollEvent loop
 
-        // update phhys
+        // --- Update physics ---
         float dtSeconds = clock.restart().asSeconds();
         if (dtSeconds > 0.05f) dtSeconds = 0.05f;
         double dt = static_cast<double>(dtSeconds);
@@ -967,9 +1138,10 @@ int main() {
         // Orbit overlay in OrbitEdit
         if (fontLoaded &&
             mode == InteractionMode::OrbitEdit &&
-            orbitEditBodyIndex >= 0 && orbitEditBodyIndex < (int)bodies.size() &&
-            orbitEditParentIndex >= 0 && orbitEditParentIndex < (int)bodies.size()) {
-            drawOrbitOverlay(window, bodies[orbitEditBodyIndex], bodies[orbitEditParentIndex],
+            orbitEdit.active &&
+            orbitEdit.bodyIndex >= 0 && orbitEdit.bodyIndex < (int)bodies.size() &&
+            orbitEdit.parentIndex >= 0 && orbitEdit.parentIndex < (int)bodies.size()) {
+            drawOrbitOverlay(window, bodies[orbitEdit.bodyIndex], bodies[orbitEdit.parentIndex],
                              WIDTH, HEIGHT, font);
         }
 
@@ -984,8 +1156,7 @@ int main() {
             std::string modeStr;
             if (mode == InteractionMode::AddStill)       modeStr = "Add Still (1)";
             else if (mode == InteractionMode::AddMoving) modeStr = "Add Moving (2)";
-            else if (mode == InteractionMode::AddOrbitingPlace || mode == InteractionMode::OrbitEdit)
-                modeStr = "Add Orbiting (3)";
+            else modeStr = "Add Orbiting (3)";
 
             std::string selStr = "None";
             if (selectedIndex >= 0 && selectedIndex < (int)bodies.size()) {
@@ -998,7 +1169,7 @@ int main() {
                 "Del: delete selected   Up/Down: change mass\n"
                 "T: toggle trails  [ ]: trail length\n"
                 "V: toggle volume lock   X: toggle fixed\n"
-                "F: follow selected   F2: rename   Space: reset\n"
+                "F: follow selected   F2: rename   Ctrl+R: reset (with confirm)\n"
                 "I/O: zoom in/out   ,/. : slower/faster time\n" +
                 std::string("Mode: ") + modeStr +
                 "   Selected: " + selStr +
@@ -1131,6 +1302,66 @@ int main() {
                 window.draw(line);
                 y += 20.0f;
             }
+        }
+
+        // Reset confirmation popup
+        if (resetPopup.visible && fontLoaded) {
+            float pw = 300.0f;
+            float ph = 140.0f;
+            float px = (WIDTH - pw) * 0.5f;
+            float py = (HEIGHT - ph) * 0.5f;
+
+            sf::RectangleShape box(sf::Vector2f(pw, ph));
+            box.setPosition(px, py);
+            box.setFillColor(sf::Color(20, 20, 35, 240));
+            box.setOutlineThickness(1.0f);
+            box.setOutlineColor(sf::Color::White);
+            window.draw(box);
+
+            sf::Text msg;
+            msg.setFont(font);
+            msg.setCharacterSize(16);
+            msg.setFillColor(sf::Color::White);
+            msg.setString("Reset system to only the star?");
+            msg.setPosition(px + 20.0f, py + 20.0f);
+            window.draw(msg);
+
+            float btnW = 80.0f;
+            float btnH = 28.0f;
+            float gap = 20.0f;
+
+            float yesX = px + pw * 0.5f - gap - btnW;
+            float noX  = px + pw * 0.5f + gap;
+            float btnY = py + ph - btnH - 20.0f;
+
+            sf::RectangleShape yesBtn(sf::Vector2f(btnW, btnH));
+            yesBtn.setPosition(yesX, btnY);
+            yesBtn.setFillColor(sf::Color(60, 120, 60));
+            window.draw(yesBtn);
+
+            sf::RectangleShape noBtn(sf::Vector2f(btnW, btnH));
+            noBtn.setPosition(noX, btnY);
+            noBtn.setFillColor(sf::Color(120, 60, 60));
+            window.draw(noBtn);
+
+            sf::Text yesTxt;
+            yesTxt.setFont(font);
+            yesTxt.setCharacterSize(14);
+            yesTxt.setFillColor(sf::Color::White);
+            yesTxt.setString("Yes");
+            yesTxt.setPosition(yesX + 24.0f, btnY + 4.0f);
+            window.draw(yesTxt);
+
+            sf::Text noTxt;
+            noTxt.setFont(font);
+            noTxt.setCharacterSize(14);
+            noTxt.setFillColor(sf::Color::White);
+            noTxt.setString("No");
+            noTxt.setPosition(noX + 28.0f, btnY + 4.0f);
+            window.draw(noTxt);
+
+            resetPopup.yesRect = sf::FloatRect(yesX, btnY, btnW, btnH);
+            resetPopup.noRect  = sf::FloatRect(noX,  btnY, btnW, btnH);
         }
 
         window.display();
