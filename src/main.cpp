@@ -561,10 +561,10 @@ int main() {
                     }
                 }
                 // zoom + time scale adjustments
-                else if (event.key.code == sf::Keyboard::Z) { // zoom in
+                else if (event.key.code == sf::Keyboard::I) { // zoom in
                     metersPerPixel *= 0.5;
                     if (metersPerPixel < 1.0e7) metersPerPixel = 1.0e7;
-                } else if (event.key.code == sf::Keyboard::X) { // zoom out
+                } else if (event.key.code == sf::Keyboard::O) { // zoom out
                     metersPerPixel *= 2.0;
                     if (metersPerPixel > 1.0e12) metersPerPixel = 1.0e12;
                 } else if (event.key.code == sf::Keyboard::Comma) { // slower time
@@ -859,7 +859,7 @@ int main() {
                 "T: toggle trails  [ ]: trail length\n"
                 "V: toggle volume lock   X: toggle fixed\n"
                 "F: follow selected   F2: rename   Space: reset\n"
-                "Z/X: zoom in/out   ,/. : slower/faster time\n" +
+                "I/O: zoom in/out   ,/. : slower/faster time\n" +
                 std::string("Mode: ") + modeStr +
                 "   Selected: " + selStr +
                 (lockVolume ? "   [Volume LOCKED]" : "   [Volume UNLOCKED]");
