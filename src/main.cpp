@@ -59,7 +59,7 @@ struct Body {
     sf::Color color;
 
     double density;
-    double radius;       // pixels
+    double radius;       // "base" visual radius at reference zoom
     bool   fixed = false;
     bool   ghost = false; // ghost: visible but no gravity / motion
 
@@ -81,7 +81,7 @@ const double M_SUN   = 1.98847e30;         // kg
 const double M_EARTH = 5.97219e24;         // kg
 
 // Simulation scale (mutable)
-double metersPerPixel = 1.0e9;             // 1 px = 1e9 m
+double metersPerPixel = 1.0e9;             // 1 px = 1e9 m  (reference scale)
 double timeScale      = 86400.0;           // 1 real s = 1 simulated day
 
 // Softening in meters
@@ -478,14 +478,14 @@ void applyOrbitDrag(
         double r_ap_new = r_ap_old;
 
         if (orbitEdit.dragHandle == OrbitHandle::Pe) {
-            // user intends to drag Pe distance
+            // drag Pe distance
             r_pe_new = r_mouse;
 
             if (r_pe_new > r_ap_old) {
                 // swap roles: mouse point is now Ap
                 std::swap(r_pe_new, r_ap_old);
                 orbitEdit.dragHandle = OrbitHandle::Ap;
-                // orientation u points to new Pe, which is opposite current mouse direction:
+                // orientation u points to new Pe (opposite)
                 orbitEdit.u.x = -orbitEdit.u.x;
                 orbitEdit.u.y = -orbitEdit.u.y;
                 orbitEdit.v = { -orbitEdit.u.y, orbitEdit.u.x };
@@ -498,8 +498,7 @@ void applyOrbitDrag(
                 // swap roles: mouse point is now Pe
                 std::swap(r_ap_new, r_pe_old);
                 orbitEdit.dragHandle = OrbitHandle::Pe;
-                // orientation u points toward new Pe (mouse direction)
-                // (already set above)
+                // orientation u points to new Pe (mouse direction already)
             }
         }
 
@@ -509,8 +508,8 @@ void applyOrbitDrag(
 
         orbitEdit.a = 0.5 * (r_pe_new + r_ap_new);
         orbitEdit.e = (r_ap_new - r_pe_new) / (r_ap_new + r_pe_new);
-        if (orbitEdit.e < 0.0) orbitEdit.e = 0.0;
-        if (orbitEdit.e > 0.99) orbitEdit.e = 0.99;
+        if (orbitEdit.e < 0.0)   orbitEdit.e = 0.0;
+        if (orbitEdit.e > 0.99)  orbitEdit.e = 0.99;
 
         // keep ν as angleMouse (body stays roughly where it is angle-wise)
         orbitEdit.nu = angleMouse;
@@ -680,6 +679,58 @@ void resetSystem(std::vector<Body>& bodies, Body& star) {
 }
 
 // --------------------
+// draw controls panel
+// --------------------
+void drawControlsPanel(sf::RenderWindow& window, const sf::Font& font, float WIDTH) {
+    sf::RectangleShape panel;
+    float pw = 360.0f;
+    float ph = 190.0f;
+    panel.setSize({pw, ph});
+    panel.setPosition(WIDTH - pw - 10.0f, 10.0f);
+    panel.setFillColor(sf::Color(20, 20, 35, 230));
+    panel.setOutlineThickness(1.0f);
+    panel.setOutlineColor(sf::Color(120, 120, 120));
+    window.draw(panel);
+
+    sf::Text t;
+    t.setFont(font);
+    t.setCharacterSize(13);
+    t.setFillColor(sf::Color::White);
+
+    float x = panel.getPosition().x + 8.0f;
+    float y = panel.getPosition().y + 6.0f;
+
+    t.setCharacterSize(14);
+    t.setString("Controls");
+    t.setPosition(x, y);
+    window.draw(t);
+    y += 20.0f;
+    t.setCharacterSize(12);
+
+    auto line = [&](const std::string& s) {
+        t.setPosition(x, y);
+        t.setString(s);
+        window.draw(t);
+        y += 14.0f;
+    };
+
+    line("LMB: add body (mode-dependent)");
+    line("RMB: select body (open editor)");
+    line("1/2/3: Add Still / Moving / Orbiting");
+    line("Enter (in orbit edit): commit orbit");
+    line("Esc: cancel rename / orbit edit / reset dialog");
+    line("Del: delete selected body");
+    line("Up/Down: scale mass of selected");
+    line("T: toggle trails   [ ]: change trail length");
+    line("V: toggle volume lock   X: toggle fixed");
+    line("F: follow selected body");
+    line("F2: rename selected");
+    line("Ctrl+R: reset system (confirm dialog)");
+    line("I/O: zoom in/out");
+    line(", / . : slower / faster time");
+}
+
+// --------------------
 // main
 // --------------------
 int main() {
@@ -698,7 +749,7 @@ int main() {
     star.velocity = {0.0, 0.0};
     star.color    = sf::Color::Yellow;
     star.density  = 1.0;
-    star.radius   = 20.0; // pixels
+    star.radius   = 20.0; // base visual size at reference zoom
     star.fixed    = true;
     star.name     = "Sol";
     bodies.push_back(star);
@@ -1076,7 +1127,7 @@ int main() {
             step(bodies, dt);
         }
 
-        // Update view center
+        // Update view center (follow mode)
         if (viewBodyIndex >= 0 && viewBodyIndex < (int)bodies.size()) {
             viewCenterWorld = bodies[viewBodyIndex].position;
         }
@@ -1110,11 +1161,15 @@ int main() {
             window.draw(line, 2, sf::Lines);
         }
 
-        // Draw bodies
+        // Draw bodies (zoom-aware size)
+        double zoomScale = 1.0e9 / metersPerPixel; // 1 at reference zoom
         for (std::size_t i = 0; i < bodies.size(); ++i) {
             const Body& b = bodies[i];
             sf::Vector2f screenPos = worldToScreen(b.position, WIDTH, HEIGHT);
-            float radius = static_cast<float>(b.radius);
+
+            float radius = static_cast<float>(b.radius * zoomScale);
+            if (radius < 2.0f)  radius = 2.0f;
+            if (radius > 60.0f) radius = 60.0f;
 
             sf::CircleShape circle(radius);
             circle.setOrigin(radius, radius);
@@ -1145,7 +1200,7 @@ int main() {
                              WIDTH, HEIGHT, font);
         }
 
-        // HUD
+        // HUD: minimal top-left status
         if (fontLoaded) {
             sf::Text text;
             text.setFont(font);
@@ -1163,17 +1218,9 @@ int main() {
                 selStr = bodies[selectedIndex].name;
             }
 
-            std::string hud =
-                "M1: add body   M2: select body\n"
-                "1: add still   2: add moving   3: add orbiting (Enter=commit, Esc=cancel)\n"
-                "Del: delete selected   Up/Down: change mass\n"
-                "T: toggle trails  [ ]: trail length\n"
-                "V: toggle volume lock   X: toggle fixed\n"
-                "F: follow selected   F2: rename   Ctrl+R: reset (with confirm)\n"
-                "I/O: zoom in/out   ,/. : slower/faster time\n" +
-                std::string("Mode: ") + modeStr +
-                "   Selected: " + selStr +
-                (lockVolume ? "   [Volume LOCKED]" : "   [Volume UNLOCKED]");
+            std::string hud = "Mode: " + modeStr +
+                              "   Selected: " + selStr +
+                              (lockVolume ? "   [Volume LOCKED]" : "   [Volume UNLOCKED]");
 
             text.setString(hud);
             window.draw(text);
@@ -1194,6 +1241,9 @@ int main() {
             timeText.setPosition(10.0f, HEIGHT - 22.0f);
             timeText.setString("Time:  " + formatTimeScaleStr());
             window.draw(timeText);
+
+            // controls panel (top-right)
+            drawControlsPanel(window, font, (float)WIDTH);
         }
 
         // Body panel
@@ -1286,9 +1336,9 @@ int main() {
                 window.draw(line);
                 y += 20.0f;
 
-                // Radius (pixels)
+                // Radius (base radius)
                 line.setPosition(x, y);
-                line.setString("Radius: " + formatSci(b.radius) + " px");
+                line.setString("Radius: " + formatSci(b.radius) + " (base px)");
                 window.draw(line);
                 y += 20.0f;
 
