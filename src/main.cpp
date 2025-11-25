@@ -9,23 +9,24 @@
 // --------------------
 struct Vec2 {
     double x, y;
+
     Vec2 operator+(const Vec2& other) const { return {x + other.x, y + other.y}; }
     Vec2 operator-(const Vec2& other) const { return {x - other.x, y - other.y}; }
-    Vec2 operator*(double s) const { return {x*s, y*s}; }
+    Vec2 operator*(double s)        const { return {x * s, y * s}; }
 
-    Vec2 operator+=(const Vec2& other) {
+    Vec2& operator+=(const Vec2& other) {
         x += other.x;
         y += other.y;
         return *this;
     }
-    Vec2 operator *=(double s) {
+    Vec2& operator*=(double s) {
         x *= s;
         y *= s;
         return *this;
     }
 };
 
-double length (const Vec2& v) {
+double length(const Vec2& v) {
     return std::sqrt(v.x * v.x + v.y * v.y);
 }
 
@@ -37,25 +38,28 @@ struct BodyTypeInfo {
     std::string description;
 };
 
-static BodyTypeInfo genericPlanetType {
+static BodyTypeInfo genericPlanetType{
     "cold arid nontectonic subearth",
     "non-tectonic rocky planet with low surface temperatures and thin/absent atmosphere"
 };
 
 struct Body {
-    double mass;
-    Vec2 position;
-    Vec2 velocity;
-    Vec2 acceleration;
+    double mass;         // kg
+    Vec2   position;     // meters
+    Vec2   velocity;     // m/s
+    Vec2   acceleration; // m/s^2
     sf::Color color;
-    // phys properties
+
+    // phys-ish properties (internal units, not strictly SI for radius)
     double density;
-    double radius;
-    bool fixed = false;
-    // metadate
-    std::string name;
+    double radius;       // drawn in pixels
+    bool   fixed = false;
+
+    // metadata
+    std::string  name;
     BodyTypeInfo typeInfo = genericPlanetType;
-    // trail
+
+    // trail (positions in meters)
     std::vector<Vec2> trail;
 };
 
@@ -63,20 +67,33 @@ struct Body {
 // Global sim parameters
 // --------------------
 
-// grav const
-// not realistic, for now
+// Physical gravitational constant (SI)
+const double G_PHYS = 6.67430e-11;      // m^3 kg^-1 s^-2
 
-const double G = 200.0;
-const double SOFTENING = 10.0;
+// Simulation scale
+// 1 pixel represents this many meters
+const double METERS_PER_PIXEL = 1.0e9;  // 1e9 m = 1 px --> 1 AU ~= 150 px
+
+// 1 real-time second = TIME_SCALE simulated seconds
+const double TIME_SCALE = 86400.0;      // 1 real s = 1 simulated day
+
+// Softening length in meters
+const double SOFTENING_METERS = 1.0e9;  // ~1 px of softening
+
+// Mass helpers
+const double M_SUN   = 1.98847e30;      // kg
+const double M_EARTH = 5.97219e24;      // kg
 
 bool trailsEnabled = true;
-int maxTrailPoints = 200;
+int  maxTrailPoints = 200;
+
 // volume lock
 bool lockVolume = false;
+
 // helpers for radius/density
 double computeVolumeFromRadius(double r) {
     const double pi = 3.141592653589793;
-    return 4.0/3.0*pi*r*r*r;
+    return 4.0 / 3.0 * pi * r * r * r;
 }
 
 double computeRadiusFromMassDensity(double mass, double density) {
@@ -89,10 +106,10 @@ double computeRadiusFromMassDensity(double mass, double density) {
 
 void updateBodyAfterMassChange(Body& b) {
     if (!lockVolume) {
-        // keep dens and recompute radius
+        // keep density and recompute radius
         b.radius = computeRadiusFromMassDensity(b.mass, b.density);
     } else {
-        // keep radius, recompute dens
+        // keep radius, recompute density
         double volume = computeVolumeFromRadius(b.radius);
         if (volume <= 0.0) volume = 1.0;
         b.density = b.mass / volume;
@@ -100,51 +117,55 @@ void updateBodyAfterMassChange(Body& b) {
 }
 
 // --------------------
-// Compute grav accelerations
+// Compute grav accelerations (Newtonian)
 // --------------------
 void computeGravity(std::vector<Body>& bodies) {
     std::size_t n = bodies.size();
+
     for (auto& b : bodies) {
         b.acceleration = {0.0, 0.0};
     }
+
     for (std::size_t i = 0; i < n; ++i) {
         for (std::size_t j = i + 1; j < n; ++j) {
-            Vec2 r = bodies[j].position - bodies[i].position;
-            double dist = length(r) + 1e-6; //avoid div by 0
-            double invDist3 = 1.0 / std::pow(dist * dist + SOFTENING * SOFTENING, 1.5);
+            Vec2 r = bodies[j].position - bodies[i].position; // meters
+            double dist2 = r.x * r.x + r.y * r.y;
+            double softened2 = dist2 + SOFTENING_METERS * SOFTENING_METERS;
+            double softened = std::sqrt(softened2);
+            if (softened < 1.0) softened = 1.0;
 
-            Vec2 dir = r;
-            double factor = G *invDist3;
+            double invDist3 = 1.0 / (softened2 * softened);
 
-            Vec2 accel_i = dir * (factor * bodies[j].mass);
-            Vec2 accel_j = dir * (-factor *bodies[i].mass);
+            // a_i = G * m_j * r / |r|^3
+            Vec2 accel_i = r * (G_PHYS * bodies[j].mass * invDist3);
+            Vec2 accel_j = r * (-G_PHYS * bodies[i].mass * invDist3);
 
             bodies[i].acceleration += accel_i;
             bodies[j].acceleration += accel_j;
         }
-    }    
+    }
 }
 
 // --------------------
 // integrator
-// this shit is so fucking painful i just want to sleep
 // --------------------
+void step(std::vector<Body>& bodies, double dtRealSeconds) {
+    double dt = dtRealSeconds * TIME_SCALE;  // seconds of simulated time
 
-void step(std::vector<Body>& bodies, double dt) {
-    // update velocities
     for (auto& b : bodies) {
         if (!b.fixed) {
-            b.velocity += b.acceleration * dt;
+            b.velocity += b.acceleration * dt; // m/s
         }
     }
-    // update pos
+
     for (auto& b : bodies) {
         if (!b.fixed) {
-            b.position += b.velocity * dt;
+            b.position += b.velocity * dt;     // meters
         }
     }
+
     computeGravity(bodies);
-    // update trails
+
     if (trailsEnabled) {
         for (auto& b : bodies) {
             b.trail.push_back(b.position);
@@ -159,23 +180,22 @@ void step(std::vector<Body>& bodies, double dt) {
 
 // --------------------
 // interaction modes
-// 
-// late registration is a classic
 // --------------------
 enum class InteractionMode {
     AddStill,
     AddMoving,
     AddOrbiting
 };
-// find nearest body to a point on the screen
-int findNearestBody(const std::vector<Body>& bodies, const sf::Vector2f& point, float maxDistPixels) {
+
+// find nearest body to a world-space point (meters)
+int findNearestBody(const std::vector<Body>& bodies, const Vec2& pointMeters, double maxDistMeters) {
     int bestIndex = -1;
-    double bestDist2 = static_cast<double>(maxDistPixels) * maxDistPixels;
+    double bestDist2 = maxDistMeters * maxDistMeters;
 
     for (std::size_t i = 0; i < bodies.size(); ++i) {
-        double dx = bodies[i].position.x - point.x;
-        double dy = bodies [i].position.y - point.y;
-        double d2 = dx*dx + dy*dy;
+        double dx = bodies[i].position.x - pointMeters.x;
+        double dy = bodies[i].position.y - pointMeters.y;
+        double d2 = dx * dx + dy * dy;
         if (d2 < bestDist2) {
             bestDist2 = d2;
             bestIndex = static_cast<int>(i);
@@ -184,33 +204,59 @@ int findNearestBody(const std::vector<Body>& bodies, const sf::Vector2f& point, 
     return bestIndex;
 }
 
+// choose parent body by maximum GM/r^2 at a point
+int findStrongestInfluenceParent(const std::vector<Body>& bodies, const Vec2& posMeters) {
+    int bestIndex = -1;
+    double bestAccel = 0.0;
+
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+        Vec2 r = bodies[i].position - posMeters;
+        double dist2 = r.x * r.x + r.y * r.y;
+        if (dist2 <= 0.0) continue;
+
+        double accel = G_PHYS * bodies[i].mass / dist2; // magnitude GM/r^2
+        if (accel > bestAccel) {
+            bestAccel = accel;
+            bestIndex = static_cast<int>(i);
+        }
+    }
+    return bestIndex;
+}
+
 // camera rel body
 Vec2 viewCenterWorld{0.0, 0.0};
-int viewBodyIndex = -1;
+int  viewBodyIndex = -1;
 
+// world (meters) -> screen (pixels)
 sf::Vector2f worldToScreen(const Vec2& p, double width, double height) {
     double cx = width * 0.5;
     double cy = height * 0.5;
-    double x = p.x - viewCenterWorld.x + cx;
-    double y = p.y - viewCenterWorld.y + cy;
+
+    double dx = (p.x - viewCenterWorld.x) / METERS_PER_PIXEL;
+    double dy = (p.y - viewCenterWorld.y) / METERS_PER_PIXEL;
+
+    double x = cx + dx;
+    double y = cy + dy;
+
     return sf::Vector2f(static_cast<float>(x), static_cast<float>(y));
 }
 
 // gui panel for sel body
 struct BodyPanel {
-    bool visible = false;
+    bool visible   = false;
     bool minimized = false;
     sf::Vector2f pos{20.0f, 80.0f};
     sf::Vector2f size{260.0f, 180.0f};
-    bool dragging = false;
+    bool dragging  = false;
     sf::Vector2f dragOffset{0.0f, 0.0f};
 };
+
 bool pointInRect(const sf::Vector2f& p, const sf::FloatRect& r) {
     return r.contains(p);
 }
 
 int main() {
-    const unsigned int WIDTH = 1280;
+    const unsigned int WIDTH  = 1280;
     const unsigned int HEIGHT = 720;
 
     sf::RenderWindow window(sf::VideoMode(WIDTH, HEIGHT), "PlanetSim.exe");
@@ -218,16 +264,16 @@ int main() {
 
     std::vector<Body> bodies;
 
-    // create star
+    // create star at origin in meters
     Body star;
-    star.mass = 4000.0;
-    star.position = {WIDTH / 2.0, HEIGHT / 2.0 };
-    star.velocity = { 0.0, 0.0 };
-    star.color = sf::Color::Yellow;
-    star.density = 1.0;
-    star.radius = 20.0;
-    star.fixed = true;
-    star.name = "Sol";
+    star.mass     = M_SUN;
+    star.position = {0.0, 0.0};
+    star.velocity = {0.0, 0.0};
+    star.color    = sf::Color::Yellow;
+    star.density  = 1.0;
+    star.radius   = 20.0; // pixels
+    star.fixed    = true;
+    star.name     = "Sol";
     bodies.push_back(star);
 
     computeGravity(bodies);
@@ -237,20 +283,22 @@ int main() {
 
     bool isDraggingAddMoving = false;
     Vec2 dragStart{0.0, 0.0};
+
     sf::Clock clock;
     sf::Font font;
     bool fontLoaded = font.loadFromFile("resources/arial.ttf");
-    
+
     BodyPanel bodyPanel;
 
     bool renaming = false;
     std::string renameBuffer;
 
-    viewCenterWorld = { WIDTH / 2.0, HEIGHT / 2.0 };
+    // view centered on star
+    viewCenterWorld = star.position;
 
     while (window.isOpen()) {
         sf::Event event;
-        while(window.pollEvent(event)) {
+        while (window.pollEvent(event)) {
             if (event.type == sf::Event::Closed) {
                 window.close();
             }
@@ -281,14 +329,15 @@ int main() {
                         bodies[selectedIndex].mass *= 0.8;
                         updateBodyAfterMassChange(bodies[selectedIndex]);
                     }
-                } else if (event.key.code == sf::Keyboard::Space) {
+                } else if (event.key.code == sf::Keyboard::Space && !renaming) {
+                    // reset system only when not renaming
                     bodies.clear();
                     bodies.push_back(star);
                     computeGravity(bodies);
                     selectedIndex = -1;
                     bodyPanel.visible = false;
                     viewBodyIndex = -1;
-                    viewCenterWorld = { WIDTH / 2.0, HEIGHT / 2.0};
+                    viewCenterWorld = star.position;
                     for (auto& b : bodies) b.trail.clear();
                 } else if (event.key.code == sf::Keyboard::T) {
                     trailsEnabled = !trailsEnabled;
@@ -371,7 +420,7 @@ int main() {
                                 continue;
                             }
                         } else if (panelRect.contains(mouseScreenF)) {
-                            // focus on panel
+                            // click inside panel content
                             continue;
                         }
                     }
@@ -379,47 +428,56 @@ int main() {
 
                 // panel doesn't want the event or we clicked outside it
                 if (event.mouseButton.button == sf::Mouse::Left) {
-                    if (mode == InteractionMode::AddStill || mode == InteractionMode::AddMoving || mode == InteractionMode::AddOrbiting) {
-                        // Convert mouse to world coordinates based on viewCenterWorld
+                    if (mode == InteractionMode::AddStill ||
+                        mode == InteractionMode::AddMoving ||
+                        mode == InteractionMode::AddOrbiting) {
+
                         double cx = WIDTH * 0.5;
                         double cy = HEIGHT * 0.5;
+                        // pixel -> meters
                         Vec2 worldPos{
-                            mouseScreenF.x - cx + viewCenterWorld.x,
-                            mouseScreenF.y - cy + viewCenterWorld.y
+                            (mouseScreenF.x - cx) * METERS_PER_PIXEL + viewCenterWorld.x,
+                            (mouseScreenF.y - cy) * METERS_PER_PIXEL + viewCenterWorld.y
                         };
 
                         if (mode == InteractionMode::AddStill) {
                             Body b;
-                            b.mass = 50.0;
-                            b.density = 1.0;
-                            b.radius = computeRadiusFromMassDensity(b.mass, b.density);
+                            b.mass    = M_EARTH;
+                            b.radius  = 6.0; // pixels (visual)
+                            double vol = computeVolumeFromRadius(b.radius);
+                            b.density  = b.mass / vol;
                             b.position = worldPos;
                             b.velocity = {0.0, 0.0};
-                            b.color = sf::Color::Cyan;
-                            b.name = "Body";
+                            b.color    = sf::Color::Cyan;
+                            b.name     = "Body";
                             bodies.push_back(b);
                             computeGravity(bodies);
                         } else if (mode == InteractionMode::AddMoving) {
                             isDraggingAddMoving = true;
                             dragStart = worldPos;
                         } else if (mode == InteractionMode::AddOrbiting) {
-                            if (selectedIndex >= 0) {
+                            // pick parent by strongest gravitational influence
+                            int parentIdx = findStrongestInfluenceParent(bodies, worldPos);
+                            if (parentIdx < 0) {
+                                std::cout << "No parent body found for orbiting placement.\n";
+                            } else {
                                 Body b;
-                                b.mass = 50.0;
-                                b.density = 1.0;
-                                b.radius = computeRadiusFromMassDensity(b.mass, b.density);
+                                b.mass    = M_EARTH;
+                                b.radius  = 6.0;
+                                double vol = computeVolumeFromRadius(b.radius);
+                                b.density  = b.mass / vol;
                                 b.position = worldPos;
-                                b.color = sf::Color::Green;
-                                b.name = "Orbiting body";
+                                b.color    = sf::Color::Green;
+                                b.name     = "Orbiting body";
 
-                                Body& parent = bodies[selectedIndex];
+                                Body& parent = bodies[parentIdx];
                                 Vec2 r = b.position - parent.position;
                                 double dist = length(r);
-                                if (dist < 1.0) dist = 1.0;
-                                double vmag = std::sqrt(G * parent.mass / dist);
+                                if (dist < SOFTENING_METERS) dist = SOFTENING_METERS;
 
-                                // Perpendicular direction
-                                Vec2 perp{-r.y / dist, r.x / dist};
+                                double vmag = std::sqrt(G_PHYS * parent.mass / dist);
+                                Vec2 rhat{ r.x / dist, r.y / dist };
+                                Vec2 perp{ -rhat.y, rhat.x };
                                 Vec2 vOrb = perp * vmag;
 
                                 b.velocity = parent.velocity + vOrb;
@@ -430,18 +488,16 @@ int main() {
                         }
                     }
                 } else if (event.mouseButton.button == sf::Mouse::Right) {
-                    // select nearest body
+                    // select nearest body (world-space)
                     double cx = WIDTH * 0.5;
                     double cy = HEIGHT * 0.5;
                     Vec2 worldPos{
-                        mouseScreenF.x - cx + viewCenterWorld.x,
-                        mouseScreenF.y - cy + viewCenterWorld.y
+                        (mouseScreenF.x - cx) * METERS_PER_PIXEL + viewCenterWorld.x,
+                        (mouseScreenF.y - cy) * METERS_PER_PIXEL + viewCenterWorld.y
                     };
-                    sf::Vector2f worldF(
-                        static_cast<float>(worldPos.x),
-                        static_cast<float>(worldPos.y)
-                    );
-                    int idx = findNearestBody(bodies, worldF, 25.0f);
+
+                    double maxDistMeters = 25.0 * METERS_PER_PIXEL; // 25 px selection radius
+                    int idx = findNearestBody(bodies, worldPos, maxDistMeters);
                     selectedIndex = idx;
                     if (idx >= 0) {
                         bodyPanel.visible = true;
@@ -449,7 +505,7 @@ int main() {
                     }
                 }
             }
-
+            // im tired boss
             // mouse release
             else if (event.type == sf::Event::MouseButtonReleased) {
                 if (event.mouseButton.button == sf::Mouse::Left) {
@@ -463,21 +519,23 @@ int main() {
                         double cx = WIDTH * 0.5;
                         double cy = HEIGHT * 0.5;
                         Vec2 worldEnd{
-                            mouseScreenF.x - cx + viewCenterWorld.x,
-                            mouseScreenF.y - cy + viewCenterWorld.y
+                            (mouseScreenF.x - cx) * METERS_PER_PIXEL + viewCenterWorld.x,
+                            (mouseScreenF.y - cy) * METERS_PER_PIXEL + viewCenterWorld.y
                         };
 
-                        Vec2 vel = worldEnd - dragStart;
-                        vel *= 0.5;
+                        Vec2 delta = worldEnd - dragStart;
+                        // scale down to get a reasonable initial speed
+                        Vec2 vel = delta * 1e-5; // tweak factor to taste
 
                         Body b;
-                        b.mass = 50.0;
-                        b.density = 1.0;
-                        b.radius = computeRadiusFromMassDensity(b.mass, b.density);
+                        b.mass    = M_EARTH;
+                        b.radius  = 6.0;
+                        double vol = computeVolumeFromRadius(b.radius);
+                        b.density  = b.mass / vol;
                         b.position = dragStart;
                         b.velocity = vel;
-                        b.color = sf::Color::Green;
-                        b.name = "Body";
+                        b.color    = sf::Color::Green;
+                        b.name     = "Body";
                         bodies.push_back(b);
                         computeGravity(bodies);
                     }
@@ -580,7 +638,7 @@ int main() {
         }
 
         // Body panel
-        if (bodyPanel.visible && selectedIndex >= 0 && selectedIndex < (int)bodies.size() && fontLoaded) {
+        if (bodyPanel.visible && selectedIndex >= 0 && selectedIndex < (int)bodies.size()) {
             Body& b = bodies[selectedIndex];
 
             sf::RectangleShape panel;
