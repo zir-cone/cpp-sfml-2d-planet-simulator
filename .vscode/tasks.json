@@ -10,14 +10,14 @@
         "/EHsc",
         "/std:c++17",
         "/I", "E:/Libraries/SFML-2.6.1/include",
-        "src/main.cpp",
+        "src/3d_version.cpp",
         "/link",
         "/LIBPATH:E:/Libraries/SFML-2.6.1/lib",
         "sfml-graphics.lib",
         "sfml-window.lib",
         "sfml-system.lib",
         "opengl32.lib",
-        "/OUT:PlanetSim.exe"
+        "/OUT:PlanetSim3D.exe"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
