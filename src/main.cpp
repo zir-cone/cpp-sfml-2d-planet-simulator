@@ -436,29 +436,54 @@ void recomputeBulkComposition(Body& b) {
 // --------------------
 // Integrator
 // --------------------
-void stepSim(std::vector<Body>& bodies, double dtRealSeconds) {
-    double dt = dtRealSeconds * timeScale;
+const double SECONDS_PER_DAY = 86400.0;
 
-    for (auto& b : bodies)
-        if (!b.fixed && !b.ghost)
-            b.velocity += b.acceleration * dt;
-    for (auto& b : bodies)
-        if (!b.fixed && !b.ghost)
-            b.position += b.velocity * dt;
+void step(std::vector<Body>& bodies, double dtRealSeconds)
+{
+    // total simulated time to advance this frame
+    double dtSim = dtRealSeconds * timeScale * SECONDS_PER_DAY;
 
-    computeGravity(bodies);
-    updateTemperatures(bodies);
+    // maximum allowed sim-step size (in seconds) for stability
+    const double MAX_SUBSTEP = 3600.0; // 1 simulated hour per substep
 
-    if (trailsEnabled) {
+    double absDt = std::abs(dtSim);
+    int nSub = (absDt <= MAX_SUBSTEP) ? 1
+                                      : (int)std::ceil(absDt / MAX_SUBSTEP);
+
+    double h = dtSim / nSub;  // size of each substep (can be negative if you ever go backwards)
+
+    bool recordTrails = trailsEnabled;
+    if (!recordTrails) {
+        for (auto& b : bodies)
+            b.trail.clear();
+    }
+
+    for (int s = 0; s < nSub; ++s) {
+        // v_{n+1} = v_n + a_n * h
         for (auto& b : bodies) {
-            if (!b.ghost) {
-                b.trail.push_back(b.position);
-                if ((int)b.trail.size() > maxTrailPoints)
-                    b.trail.erase(b.trail.begin());
+            if (!b.fixed) {
+                b.velocity += b.acceleration * h;
             }
         }
-    } else {
-        for (auto& b : bodies) b.trail.clear();
+
+        // x_{n+1} = x_n + v_{n+1} * h  (semi-implicit Euler)
+        for (auto& b : bodies) {
+            if (!b.fixed) {
+                b.position += b.velocity * h;
+            }
+        }
+
+        // update accelerations for next substep
+        computeGravity(bodies);
+
+        if (recordTrails) {
+            for (auto& b : bodies) {
+                b.trail.push_back(b.position);
+                if ((int)b.trail.size() > maxTrailPoints) {
+                    b.trail.erase(b.trail.begin());
+                }
+            }
+        }
     }
 }
 
@@ -485,11 +510,67 @@ int findStrongestInfluenceParent(const std::vector<Body>& bodies,
     return bestIndex;
 }
 
-// fuck me I worked SO hard on the last iteration of this function only for it to have to be replaced by a fucking handful of lines 😭😭😭😭
+// nvm ts back to a shitfuck 😭
 int chooseOrbitParent(const std::vector<Body>& bodies, const Vec2& posMeters) {
+    int bestPlanet = -1;
+    double bestScore = 1e99;
+
+    // first pass
+    for (int i = 0; i < (int)bodies.size(); ++i) {
+        const Body& p = bodies[i];
+        if (isStar(p)) continue;
+
+        // nearest star for this planet
+        int starIdx = findNearestStar(bodies, i);
+        if (starIdx < 0) continue;
+        const Body& star = bodies[starIdx];
+
+        // planet-star distance
+        Vec2 ps = p.position - star.position;
+        double dStar = length(ps);
+        if (dStar <= 0.0) continue;
+
+        // Hill radius
+        double rHill = dStar * std::cbrt(p.mass / (3.0 * star.mass));
+        if (rHill <= 0.0) continue;
+
+        // distance from click to planet
+        Vec2 dp = posMeters - p.position;
+        double dMoon = length(dp);
+
+        if (dMoon < rHill) {
+            // "i can feel it deep inside deep deep down inside" - Fade by Kanye West (The Life of Pablo, 2016)
+            double score = dMoon / rHill;
+            if (score < bestScore) {
+                bestScore = score;
+                bestPlanet = i;
+            }
+        }
+    }
+
+    if (bestPlanet != -1) {
+        return bestPlanet;  // click is inside some planet’s Hill sphere → moon
+    }
+
+    // Otherwise: pick closest star as parent
+    int bestStar = -1;
+    double bestD2 = 1e99;
+    for (int i = 0; i < (int)bodies.size(); ++i) {
+        if (!isStar(bodies[i])) continue;
+        Vec2 ds = posMeters - bodies[i].position;
+        double d2 = ds.x*ds.x + ds.y*ds.y;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            bestStar = i;
+        }
+    }
+
+    if (bestStar != -1)
+        return bestStar;
+
+    // fallback
     return findStrongestInfluenceParent(bodies, posMeters);
 }
-
 // --------------------
 // Interaction modes
 // --------------------
@@ -1529,7 +1610,7 @@ int main() {
         // ----- update physics -----
         float dtSeconds = clock.restart().asSeconds();
         if (dtSeconds > 0.05f) dtSeconds = 0.05f;
-        stepSim(bodies, dtSeconds);
+        step(bodies, dtSeconds);
 
         if (viewBodyIndex >= 0 && viewBodyIndex < (int)bodies.size())
             viewCenterWorld = bodies[viewBodyIndex].position;
@@ -1902,6 +1983,7 @@ int main() {
             window.draw(mText2);
 
             if (!bodyPanel.minimized) {
+                // --- set up clipping for everything inside the panel ---
                 auto winSize = window.getSize();
                 unsigned winH = winSize.y;
 
@@ -1914,36 +1996,13 @@ int main() {
                 glEnable(GL_SCISSOR_TEST);
                 glScissor(sx, sy, sw, sh);
 
-                float y = bodyPanel.pos.y + titleH + 6.0f + bodyPanel.scroll;
-                float x = bodyPanel.pos.x + 8.0f;
-
-                sf::Text line;
-                line.setFont(font);
-                line.setCharacterSize(13);
-                line.setFillColor(sf::Color::White);
-
-                // Name
-                line.setPosition(x, y);
-                if (renaming) {
-                    line.setString("Name: " + renameBuffer + "_");
-                } else {
-                    line.setString("Name: " + b.name + "  (F2 to rename)");
-                }
-                window.draw(line);
-                y += 20.0f;
-
-                // Type
-                line.setPosition(x, y);
-                line.setString("Type: " + b.typeInfo.name);
-                window.draw(line);
-                y += 20.0f;
-
-                sf::Text line;
-                line.setFont(font);
-                line.setCharacterSize(13);
-                line.setFillColor(sf::Color::White);
                 float x = bodyPanel.pos.x + 8.f;
                 float y = bodyPanel.pos.y + titleH + 6.0f + bodyPanel.scroll;
+
+                sf::Text line;
+                line.setFont(font);
+                line.setCharacterSize(13);
+                line.setFillColor(sf::Color::White);
 
                 auto drawLine = [&](const std::string& s) {
                     line.setPosition(x, y);
@@ -1952,6 +2011,7 @@ int main() {
                     y += 20.f;
                 };
 
+                // --- basic stats ---
                 if (renaming)
                     drawLine("Name: " + renameBuffer + "_");
                 else
@@ -1972,12 +2032,12 @@ int main() {
 
                 char buf[128];
                 std::snprintf(buf, sizeof(buf),
-                              "Comp R/M/I/G/W: %.2f/%.2f/%.2f/%.2f/%.2f",
-                              b.bulk.rock, b.bulk.metal, b.bulk.ice,
-                              b.bulk.gas, b.bulk.water);
+                            "Comp R/M/I/G/W: %.2f/%.2f/%.2f/%.2f/%.2f",
+                            b.bulk.rock, b.bulk.metal, b.bulk.ice,
+                            b.bulk.gas, b.bulk.water);
                 drawLine(buf);
 
-                // primary composition clickable boxes
+                // --- primary composition clickable boxes ---
                 line.setPosition(x, y);
                 line.setString("Primary composition (click):");
                 window.draw(line);
@@ -1986,10 +2046,10 @@ int main() {
                 float boxW = 26.f, boxH = 14.f, gap = 6.f;
                 float bx = x;
                 float by = y;
-                // #StopGooning
+
                 auto drawCompBox = [&](const char* label,
-                                       const sf::Color& col,
-                                       const sf::FloatRect& rect) {
+                                    const sf::Color& col,
+                                    const sf::FloatRect& rect) {
                     sf::RectangleShape r({boxW, boxH});
                     r.setPosition(rect.left, rect.top);
                     r.setFillColor(col);
@@ -2007,7 +2067,7 @@ int main() {
                 };
 
                 bodyPanelControls.valid = true;
-                bodyPanelControls.compRock  = sf::FloatRect(bx, by, boxW, boxH);
+                bodyPanelControls.compRock  = sf::FloatRect(bx + (boxW+gap)*0, by, boxW, boxH);
                 bodyPanelControls.compMetal = sf::FloatRect(bx + (boxW+gap)*1, by, boxW, boxH);
                 bodyPanelControls.compIce   = sf::FloatRect(bx + (boxW+gap)*2, by, boxW, boxH);
                 bodyPanelControls.compGas   = sf::FloatRect(bx + (boxW+gap)*3, by, boxW, boxH);
@@ -2021,7 +2081,7 @@ int main() {
 
                 y += boxH + 26.f;
 
-                // detailed subcomposition
+                // --- detailed subcomposition bars ---
                 line.setPosition(x, y);
                 line.setString("Detailed composition (L/R click bars):");
                 window.draw(line);

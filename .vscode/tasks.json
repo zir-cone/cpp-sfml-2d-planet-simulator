@@ -16,6 +16,7 @@
         "sfml-graphics.lib",
         "sfml-window.lib",
         "sfml-system.lib",
+        "opengl32.lib",
         "/OUT:PlanetSim.exe"
       ],
       "options": {
