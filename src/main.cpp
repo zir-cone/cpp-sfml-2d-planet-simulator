@@ -146,8 +146,8 @@ double timeScale      = 86400.0 * 50.0;               // 50 days per real second
 const double SOFTENING_METERS = 1.0e9;
 
 bool trailsEnabled = true;
-int  maxTrailPoints = 200;
-bool lockVolume     = false;
+int  maxTrailPoints = 6700;                           // SIX SEVENENNNE NUINomjiknF OW
+bool lockVolume     = false;                          // ive lost my shit
 
 // helpers radius/density
 double computeVolumeFromRadius(double r) {
@@ -462,14 +462,14 @@ void step(std::vector<Body>& bodies, double dtRealSeconds)
     for (int s = 0; s < nSub; ++s) {
         // v_{n+1} = v_n + a_n * h
         for (auto& b : bodies) {
-            if (!b.fixed) {
+            if (!b.fixed && !b.ghost) {
                 b.velocity += b.acceleration * h;
             }
         }
 
         // x_{n+1} = x_n + v_{n+1} * h  (semi-implicit Euler)
         for (auto& b : bodies) {
-            if (!b.fixed) {
+            if (!b.fixed && !b.ghost) {
                 b.position += b.velocity * h;
             }
         }
@@ -1216,10 +1216,10 @@ int main() {
                         trailsEnabled = !trailsEnabled;
                     }
                     else if (event.key.code == sf::Keyboard::LBracket) {
-                        if (maxTrailPoints > 10) maxTrailPoints -= 10;
+                        if (maxTrailPoints > 100) { maxTrailPoints -= 100;} 
                     }
                     else if (event.key.code == sf::Keyboard::RBracket) {
-                        maxTrailPoints += 10;
+                        maxTrailPoints += 100;
                     }
                     else if (event.key.code == sf::Keyboard::V) {
                         lockVolume = !lockVolume;
@@ -1482,7 +1482,7 @@ int main() {
                             b.name     = "Orbiting body";
                             b.ghost    = true;
                             b.sub = {
-                                {"Silicate rock", 0.67},
+                                {"Silicate rock", 0.67},    // 6-7 !!!!!!!!!!! 🎋🎋🌾🌾🪫🪫🥀🥀💔💔😭😭
                                 {"Iron",          0.32},
                                 {"Water",         0.01},
                                 {"Nitrogen",      0.0},
@@ -1501,9 +1501,9 @@ int main() {
 
                             Vec2 rhat = r; normalize(rhat);
                             Vec2 perp{ -rhat.y, rhat.x };
-                            double vmag = std::sqrt(G_PHYS * parent.mass / dist);
-                            b.velocity = { parent.velocity.x + perp.x * vmag,
-                                           parent.velocity.y + perp.y * vmag };
+                            double vmag = std::sqrt(G_PHYS * parent.mass / dist); // ts yaabaadoo LMFAO
+                            b.velocity = { parent.velocity.x + perp.x * vmag,     // artists who CAN SING vs artists who CANT SING
+                                           parent.velocity.y + perp.y * vmag };   // NBA Youngboy CAN SING ✅✅
                             b.color = bodyColor(b);
 
                             bodies.push_back(b);
