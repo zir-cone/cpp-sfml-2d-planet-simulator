@@ -436,21 +436,22 @@ void recomputeBulkComposition(Body& b) {
 // --------------------
 // Integrator
 // --------------------
-const double SECONDS_PER_DAY = 86400.0;
+// const double SECONDS_PER_DAY = 86400.0; im a retard for multiplying this with timescale
 
 void step(std::vector<Body>& bodies, double dtRealSeconds)
 {
     // total simulated time to advance this frame
-    double dtSim = dtRealSeconds * timeScale * SECONDS_PER_DAY;
+    double dtSim = dtRealSeconds * timeScale;
 
-    // maximum allowed sim-step size (in seconds) for stability
+    // maximum allowed step
     const double MAX_SUBSTEP = 3600.0; // 1 simulated hour per substep
 
     double absDt = std::abs(dtSim);
     int nSub = (absDt <= MAX_SUBSTEP) ? 1
-                                      : (int)std::ceil(absDt / MAX_SUBSTEP);
+                                      : (int)std::ceil(absDt / MAX_SUBSTEP); // i dont know why i do shit like this at 4 am, like why the FUCK is it split like this????
+                                                                             // im gonna keep it though cause its quirky and the cup runeth over on quirk, wow!
 
-    double h = dtSim / nSub;  // size of each substep (can be negative if you ever go backwards)
+    double h = dtSim / nSub;  // size of each substep
 
     bool recordTrails = trailsEnabled;
     if (!recordTrails) {
