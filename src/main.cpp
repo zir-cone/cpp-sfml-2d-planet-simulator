@@ -1,4 +1,5 @@
 #include <SFML/Graphics.hpp>
+#include <SFML/OpenGL.hpp>
 #include <cmath>
 #include <vector>
 #include <string>
@@ -303,17 +304,28 @@ sf::Color colorFromStarTemp(double T) {
 
 sf::Color colorFromPlanet(const Body& b) {
     sf::Color base;
-    if (b.category == BodyCategory::Rocky)
-        base = sf::Color(150, 120, 90);
-    else if (b.category == BodyCategory::Oceanic)
-        base = sf::Color(60, 110, 170);
-    else if (b.category == BodyCategory::GasGiant)
-        base = sf::Color(200, 170, 120);
-    else if (b.category == BodyCategory::IceGiant)
-        base = sf::Color(100, 150, 220);
-    else
-        base = sf::Color(160, 160, 160);
 
+    double water = b.bulk.water;
+    double ice   = b.bulk.ice;
+    double gas   = b.bulk.gas;
+
+    if (b.category == BodyCategory::GasGiant) {
+        // tan / reddish gas-giant palette
+        base = sf::Color(205, 175, 130);
+    } else if (b.category == BodyCategory::IceGiant) {
+        // pale blue
+        base = sf::Color(115, 175, 230);
+    } else {
+        // Rock-likes: water-heavy => oceanic blue, else rocky / metallic browns
+        if (water > 0.25)
+            base = sf::Color(60, 110, 170);      // marine / oceanic
+        else if (ice > 0.3)
+            base = sf::Color(180, 220, 250);     // icy silicate
+        else
+            base = sf::Color(150, 120, 90);      // generic rocky
+    }
+
+    // simple temperature tinting
     double T = b.temperatureK;
     double factor = std::clamp((T - 100.0) / 400.0, 0.6, 1.4);
     auto cl = [&](int c) {
@@ -333,29 +345,62 @@ sf::Color bodyColor(const Body& b) {
 void updatePlanetCategoryFromComp(Body& b) {
     if (isStar(b)) return;
 
-    double rockLike   = b.bulk.rock + b.bulk.metal;
-    double waterLike  = b.bulk.water;
-    double iceLike    = b.bulk.ice;
-    double gasLike    = b.bulk.gas;
+    double rock   = b.bulk.rock;
+    double metal  = b.bulk.metal;
+    double ice    = b.bulk.ice;
+    double gas    = b.bulk.gas;
+    double water  = b.bulk.water;
 
-    if (gasLike > 0.6 && b.mass > 10.0 * M_EARTH) {
+    double mEarth = b.mass / M_EARTH;
+    double mJup   = b.mass / 1.898e27; // Jupiter mass
+
+    // size label
+    std::string sizeLabel;
+    if (mEarth < 0.5)       sizeLabel = "subterra";
+    else if (mEarth < 2.0)  sizeLabel = "terra";
+    else if (mEarth < 10.0) sizeLabel = "superterra";
+    else                    sizeLabel = "superearth";
+
+    bool nontectonic = (mEarth < 0.4);   // crude tectonics heuristic
+    bool marine      = (water > 0.25 && (rock + metal) > 0.4);
+    bool metallic    = (metal > rock);
+
+    // --- Gas / ice giant side ---
+    if (gas > 0.6 && mJup >= 0.1) {
         b.category = BodyCategory::GasGiant;
-        b.typeInfo = gasType;
-        b.albedo   = 0.4;
-    } else if ((iceLike + waterLike > 0.6) && b.mass > 5.0 * M_EARTH) {
+
+        if (mJup < 0.5)       b.typeInfo.name = "Gaseous subjupiter";
+        else if (mJup < 2.0)  b.typeInfo.name = "Jovian";
+        else                  b.typeInfo.name = "Superjupiter";
+
+        b.albedo = 0.4;
+    }
+    else if ((ice + water + gas) > 0.6 && mEarth > 5.0) {
         b.category = BodyCategory::IceGiant;
-        b.typeInfo = iceType;
-        b.albedo   = 0.5;
-    } else if (waterLike > 0.4) {
-        b.category = BodyCategory::Oceanic;
-        b.typeInfo = oceanType;
-        b.albedo   = 0.3;
-    } else {
+
+        if (mEarth < 10.0)       b.typeInfo.name = "Ice giant subneptune";
+        else if (mEarth < 25.0)  b.typeInfo.name = "Ice giant";
+        else                     b.typeInfo.name = "Superneptune";
+
+        b.albedo = 0.5;
+    }
+    // --- Terrestrial side ---
+    else {
         b.category = BodyCategory::Rocky;
-        b.typeInfo = rockyType;
-        b.albedo   = 0.25;
+
+        std::string prefix;
+        if (marine)          prefix = "Marine continental ";
+        else if (metallic)   prefix = "Metallic ";
+        else                 prefix = "Rocky ";
+
+        std::string tect;
+        if (nontectonic) tect = "nontectonic ";
+
+        b.typeInfo.name = prefix + tect + sizeLabel;
+        b.albedo = marine ? 0.3 : 0.25;
     }
 
+    b.typeInfo.description = "Auto-classified from mass and bulk composition.";
     b.color = bodyColor(b);
 }
 
@@ -440,50 +485,8 @@ int findStrongestInfluenceParent(const std::vector<Body>& bodies,
     return bestIndex;
 }
 
-// use star + Hill sphere so moons attach to planets
-int chooseOrbitParent(const std::vector<Body>& bodies,
-                      const Vec2& posMeters)
-{
-    int starIndex = -1;
-    double starMass = 0.0;
-    for (int i = 0; i < (int)bodies.size(); ++i) {
-        if (isStar(bodies[i]) && bodies[i].mass > starMass) {
-            starMass = bodies[i].mass;
-            starIndex = i;
-        }
-    }
-
-    if (starIndex >= 0) {
-        int bestPlanet = -1;
-        double bestDist = 1e99;
-
-        const Body& star = bodies[starIndex];
-
-        for (int i = 0; i < (int)bodies.size(); ++i) {
-            if (i == starIndex) continue;
-            const Body& p = bodies[i];
-
-            Vec2 rsp = p.position - star.position;
-            double a_p = length(rsp);
-            if (a_p <= 0.0) continue;
-
-            double mu = p.mass / (3.0 * star.mass);
-            if (mu <= 0.0) continue;
-            double rH = a_p * std::cbrt(mu);   // Hill radius
-
-            Vec2 rb = posMeters - p.position;
-            double dist = length(rb);
-            if (dist < 0.6 * rH && dist < bestDist) {
-                bestDist = dist;
-                bestPlanet = i;
-            }
-        }
-
-        if (bestPlanet >= 0) return bestPlanet;
-        return starIndex;
-    }
-
-    // fallback when no star is defined
+// fuck me I worked SO hard on the last iteration of this function only for it to have to be replaced by a fucking handful of lines 😭😭😭😭
+int chooseOrbitParent(const std::vector<Body>& bodies, const Vec2& posMeters) {
     return findStrongestInfluenceParent(bodies, posMeters);
 }
 
@@ -518,12 +521,13 @@ int findNearestBody(const std::vector<Body>& bodies,
 // Panels
 // --------------------
 struct Panel {
-    bool visible   = false;
+    bool visible = false;
     bool minimized = false;
-    sf::Vector2f pos{20.f, 80.f};
-    sf::Vector2f size{260.f, 180.f};
-    bool dragging  = false;
-    sf::Vector2f dragOffset{0.f, 0.f};
+    sf::Vector2f pos{20.0f, 80.0f};
+    sf::Vector2f size{360.0f, 280.0f};
+    bool dragging = false;
+    sf::Vector2f dragOffset{0.0f, 0.0f};
+    float scroll = 0.0f;   // vertical scroll offset for content
 };
 
 bool pointInRect(const sf::Vector2f& p, const sf::FloatRect& r) {
@@ -926,7 +930,7 @@ bool gHasLightingShader = false;
 const char* PLANET_FRAGMENT_SHADER = R"(
 uniform sampler2D texture;
 uniform vec3 baseColor;
-uniform vec2 lightDir;  // direction *to* the light in world/screen space
+uniform vec2 lightDir;  // direction *to* the star
 uniform float ambient;
 
 void main()
@@ -936,15 +940,20 @@ void main()
     if (mask.a < 0.05)
         discard;
 
-    // Map UV -> [-1,1] circle coordinates
+    // map UV -> [-1,1] disk
     vec2 p = uv * 2.0 - 1.0;
     float r2 = dot(p, p);
     if (r2 > 1.0)
         discard;
 
-    // 2D Lambert shading
-    vec2 n = normalize(p);          // surface normal in screen plane
-    vec2 L = normalize(lightDir);   // direction *to* the star
+    // reconstruct a 3D unit-sphere normal
+    // note: screen Y goes down, so flip sign to get math-style up
+    float z = sqrt(max(0.0, 1.0 - r2));
+    vec3 n = normalize(vec3(p.x, -p.y, z));
+
+    // light direction in the same space (z = 0)
+    vec3 L = normalize(vec3(lightDir.x, -lightDir.y, 0.0));
+
     float ndotl = max(dot(n, L), 0.0);
     float lighting = ambient + (1.0 - ambient) * ndotl;
 
@@ -952,7 +961,6 @@ void main()
     gl_FragColor = vec4(col, mask.a);
 }
 )";
-
 
 // --------------------
 // fml
@@ -1177,6 +1185,21 @@ int main() {
                     if (!renameBuffer.empty()) renameBuffer.pop_back();
                 } else if (event.text.unicode >= 32 && event.text.unicode < 127) {
                     renameBuffer.push_back(static_cast<char>(event.text.unicode));
+                }
+            }
+            else if (event.type == sf::Event::MouseWheelScrolled) {
+                sf::Vector2f mouse = window.mapPixelToCoords(sf::Mouse::getPosition(window));
+                sf::FloatRect panelRect(bodyPanel.pos, bodyPanel.size);
+
+                if (panelRect.contains(mouse) && bodyPanel.visible && !bodyPanel.minimized) {
+                    // delta > 0 => scroll up
+                    bodyPanel.scroll += event.mouseWheelScroll.delta * 20.f;
+
+                    // clamp scroll so we don't wander off into nowhere
+                    const float minScroll = -260.f; // tune as needed
+                    const float maxScroll = 0.f;
+                    if (bodyPanel.scroll > maxScroll) bodyPanel.scroll = maxScroll;
+                    if (bodyPanel.scroll < minScroll) bodyPanel.scroll = minScroll;
                 }
             }
             else if (event.type == sf::Event::MouseButtonPressed) {
@@ -1879,12 +1902,48 @@ int main() {
             window.draw(mText2);
 
             if (!bodyPanel.minimized) {
+                auto winSize = window.getSize();
+                unsigned winH = winSize.y;
+
+                // scissor rect is in window coordinates from bottom-left
+                GLint sx = static_cast<GLint>(bodyPanel.pos.x);
+                GLint sy = static_cast<GLint>(winH - (bodyPanel.pos.y + bodyPanel.size.y));
+                GLsizei sw = static_cast<GLsizei>(bodyPanel.size.x);
+                GLsizei sh = static_cast<GLsizei>(bodyPanel.size.y);
+
+                glEnable(GL_SCISSOR_TEST);
+                glScissor(sx, sy, sw, sh);
+
+                float y = bodyPanel.pos.y + titleH + 6.0f + bodyPanel.scroll;
+                float x = bodyPanel.pos.x + 8.0f;
+
+                sf::Text line;
+                line.setFont(font);
+                line.setCharacterSize(13);
+                line.setFillColor(sf::Color::White);
+
+                // Name
+                line.setPosition(x, y);
+                if (renaming) {
+                    line.setString("Name: " + renameBuffer + "_");
+                } else {
+                    line.setString("Name: " + b.name + "  (F2 to rename)");
+                }
+                window.draw(line);
+                y += 20.0f;
+
+                // Type
+                line.setPosition(x, y);
+                line.setString("Type: " + b.typeInfo.name);
+                window.draw(line);
+                y += 20.0f;
+
                 sf::Text line;
                 line.setFont(font);
                 line.setCharacterSize(13);
                 line.setFillColor(sf::Color::White);
                 float x = bodyPanel.pos.x + 8.f;
-                float y = bodyPanel.pos.y + titleH + 6.f;
+                float y = bodyPanel.pos.y + titleH + 6.0f + bodyPanel.scroll;
 
                 auto drawLine = [&](const std::string& s) {
                     line.setPosition(x, y);
@@ -2004,6 +2063,8 @@ int main() {
                 flags += "   Volume lock: ";
                 flags += (lockVolume ? "On" : "Off");
                 drawLine(flags);
+
+                glDisable(GL_SCISSOR_TEST);
             }
         }
 
