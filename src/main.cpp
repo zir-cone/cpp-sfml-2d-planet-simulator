@@ -4,9 +4,10 @@
 #include <string>
 #include <iostream>
 #include <cstdio>
+#include <algorithm>
 
 // --------------------
-// Basic 2d vector
+// Basic 2D vector
 // --------------------
 struct Vec2 {
     double x, y;
@@ -47,7 +48,7 @@ std::string formatDistance(double meters) {
 }
 
 // --------------------
-// Body types & composition
+// Types & composition
 // --------------------
 struct BodyTypeInfo {
     std::string name;
@@ -62,15 +63,19 @@ enum class BodyCategory {
     IceGiant
 };
 
-struct Composition {
-    double rock   = 0.0;
-    double metal  = 0.0;
-    double ice    = 0.0;
-    double gas    = 0.0;
-    double water  = 0.0;
+struct CompositionBulk {
+    double rock  = 0.0;
+    double metal = 0.0;
+    double ice   = 0.0;
+    double gas   = 0.0;
+    double water = 0.0;
 };
 
-// some default type infos
+struct SubComponent {
+    std::string name;
+    double fraction; // mass fraction (0..1)
+};
+
 static BodyTypeInfo rockyType {
     "rocky terrestrial",
     "solid silicate/metal body with thin atmosphere"
@@ -93,14 +98,13 @@ static BodyTypeInfo starType {
 };
 
 // --------------------
-// Bodies
+// Body
 // --------------------
 struct Body {
     double mass;         // kg
     Vec2   position;     // m
     Vec2   velocity;     // m/s
     Vec2   acceleration; // m/s^2
-    sf::Color color;
 
     double density;
     double radius;       // base visual radius at reference zoom (px)
@@ -110,13 +114,16 @@ struct Body {
     std::string  name;
     BodyTypeInfo typeInfo;
     BodyCategory category = BodyCategory::Rocky;
-    Composition  comp;
 
-    // thermal / radiative stuff
-    double temperatureK   = 288.0;   // surface temp (planets) or effective temp (stars)
-    double luminosityW    = 0.0;     // stars only
-    double albedo         = 0.3;     // planets
+    CompositionBulk bulk;
+    std::vector<SubComponent> sub;
 
+    // thermal / radiative
+    double temperatureK = 288.0;   // surface temp (planets) or effective temp (stars)
+    double luminosityW  = 0.0;     // stars only
+    double albedo       = 0.3;     // planets
+
+    sf::Color color;
     std::vector<Vec2> trail;
 };
 
@@ -130,18 +137,17 @@ const double YEAR_SECONDS = 365.25 * 24.0 * 3600.0;
 const double M_SUN   = 1.98847e30;
 const double M_EARTH = 5.97219e24;
 
-// scale (mutable)
+// scale / time (mutable)
 double metersPerPixel = 1.0e9;                        // 1 px = 1e9 m
 double timeScale      = 86400.0 * 50.0;               // 50 days per real second
 
-// softening
 const double SOFTENING_METERS = 1.0e9;
 
 bool trailsEnabled = true;
 int  maxTrailPoints = 200;
 bool lockVolume     = false;
 
-// helpers for radius/density
+// helpers radius/density
 double computeVolumeFromRadius(double r) {
     const double pi = 3.141592653589793;
     return 4.0 / 3.0 * pi * r * r * r;
@@ -150,8 +156,7 @@ double computeRadiusFromMassDensity(double mass, double density) {
     if (density <= 0.0) density = 1.0;
     double volume = mass / density;
     const double pi = 3.141592653589793;
-    double r = std::cbrt((3.0 * volume) / (4.0 * pi));
-    return r;
+    return std::cbrt((3.0 * volume) / (4.0 * pi));
 }
 void updateBodyAfterMassChange(Body& b) {
     if (!lockVolume) {
@@ -172,105 +177,211 @@ int  viewBodyIndex = -1;
 sf::Vector2f worldToScreen(const Vec2& p, double width, double height) {
     double cx = width * 0.5;
     double cy = height * 0.5;
-
     double dx = (p.x - viewCenterWorld.x) / metersPerPixel;
     double dy = (p.y - viewCenterWorld.y) / metersPerPixel;
-
-    return sf::Vector2f(
-        static_cast<float>(cx + dx),
-        static_cast<float>(cy + dy)
-    );
+    return sf::Vector2f(static_cast<float>(cx + dx),
+                        static_cast<float>(cy + dy));
 }
 
 // --------------------
-// Gravity
-// --------------------
-void computeGravity(std::vector<Body>& bodies) {
-    std::size_t n = bodies.size();
-    for (auto& b : bodies) {
-        b.acceleration = {0.0, 0.0};
-    }
-
-    for (std::size_t i = 0; i < n; ++i) {
-        if (bodies[i].ghost) continue; // ghost: ignored
-        for (std::size_t j = i + 1; j < n; ++j) {
-            if (bodies[j].ghost) continue;
-
-            Vec2 r = bodies[j].position - bodies[i].position;
-            double dist2 = r.x * r.x + r.y * r.y;
-            double softened2 = dist2 + SOFTENING_METERS * SOFTENING_METERS;
-            double softened  = std::sqrt(softened2);
-            if (softened < 1.0) softened = 1.0;
-            double invDist3  = 1.0 / (softened2 * softened);
-
-            Vec2 accel_i = r * (G_PHYS * bodies[j].mass * invDist3);
-            Vec2 accel_j = r * (-G_PHYS * bodies[i].mass * invDist3);
-
-            bodies[i].acceleration += accel_i;
-            bodies[j].acceleration += accel_j;
-        }
-    }
-}
-
-// --------------------
-// Thermal model
+// Gravity & thermal
 // --------------------
 bool isStar(const Body& b) {
     return b.category == BodyCategory::Star;
 }
-void updateTemperatures(std::vector<Body>& bodies) {
-    // collect stars
-    std::vector<int> starIndices;
-    for (int i = 0; i < (int)bodies.size(); ++i) {
-        if (isStar(bodies[i]) && bodies[i].luminosityW > 0.0)
-            starIndices.push_back(i);
+
+void computeGravity(std::vector<Body>& bodies) {
+    std::size_t n = bodies.size();
+    for (auto& b : bodies) b.acceleration = {0.0, 0.0};
+
+    for (std::size_t i = 0; i < n; ++i) {
+        if (bodies[i].ghost) continue;
+        for (std::size_t j = i + 1; j < n; ++j) {
+            if (bodies[j].ghost) continue;
+            Vec2 r = bodies[j].position - bodies[i].position;
+            double dist2 = r.x * r.x + r.y * r.y;
+            double soft2 = dist2 + SOFTENING_METERS * SOFTENING_METERS;
+            double soft  = std::sqrt(soft2);
+            if (soft < 1.0) soft = 1.0;
+            double invDist3 = 1.0 / (soft2 * soft);
+
+            Vec2 acc_i = r * (G_PHYS * bodies[j].mass * invDist3);
+            Vec2 acc_j = r * (-G_PHYS * bodies[i].mass * invDist3);
+            bodies[i].acceleration += acc_i;
+            bodies[j].acceleration += acc_j;
+        }
     }
-    if (starIndices.empty()) return;
+}
+
+void updateTemperatures(std::vector<Body>& bodies) {
+    std::vector<int> starIdx;
+    for (int i = 0; i < (int)bodies.size(); ++i)
+        if (isStar(bodies[i]) && bodies[i].luminosityW > 0.0)
+            starIdx.push_back(i);
+    if (starIdx.empty()) return;
 
     for (int i = 0; i < (int)bodies.size(); ++i) {
         Body& body = bodies[i];
         if (isStar(body)) continue;
 
-        // find nearest star
         double bestDist2 = 1e99;
         const Body* bestStar = nullptr;
-        for (int si : starIndices) {
-            Body& s = bodies[si];
+        for (int si : starIdx) {
+            const Body& s = bodies[si];
             Vec2 r = body.position - s.position;
             double d2 = r.x*r.x + r.y*r.y;
-            if (d2 < bestDist2) {
-                bestDist2 = d2;
-                bestStar = &s;
-            }
+            if (d2 < bestDist2) { bestDist2 = d2; bestStar = &s; }
         }
         if (!bestStar) continue;
 
         double r = std::sqrt(bestDist2);
         if (r <= 0.0) r = 1.0;
-
-        // simple radiative equilibrium
         double F = bestStar->luminosityW / (4.0 * 3.141592653589793 * r * r);
-        double T = std::pow( (F * (1.0 - body.albedo)) / (4.0 * SIGMA_SB), 0.25 );
+        double T = std::pow((F * (1.0 - body.albedo)) / (4.0 * SIGMA_SB), 0.25);
         if (std::isfinite(T)) body.temperatureK = T;
     }
 }
 
 // --------------------
-// Step integrator
+// Star & planet category helpers
+// --------------------
+void updateStarFromMass(Body& b) {
+    if (!isStar(b)) return;
+    double mMsun = b.mass / M_SUN;
+    if (mMsun < 0.1) mMsun = 0.1;
+    if (mMsun > 50.0) mMsun = 50.0;
+
+    const double Lsun = 3.828e26;
+    const double Tsun = 5800.0;
+
+    b.luminosityW  = Lsun * std::pow(mMsun, 3.5);
+    b.temperatureK = Tsun * std::pow(mMsun, 0.5);
+
+    double Rsun_px = 18.0;
+    b.radius = Rsun_px * std::pow(mMsun, 0.8);
+}
+
+sf::Color colorFromStarTemp(double T) {
+    T = std::clamp(T, 2000.0, 40000.0);
+    double t = T / 100.0;
+    double r, g, b;
+    if (t <= 66.0) {
+        r = 255.0;
+        g = 99.4708025861 * std::log(t) - 161.1195681661;
+        if (t <= 19.0) b = 0.0;
+        else          b = 138.5177312231 * std::log(t - 10.0) - 305.0447927307;
+    } else {
+        r = 329.698727446 * std::pow(t - 60.0, -0.1332047592);
+        g = 288.1221695283 * std::pow(t - 60.0, -0.0755148492);
+        b = 255.0;
+    }
+    auto cl = [](double x) {
+        if (x < 0.0) x = 0.0;
+        if (x > 255.0) x = 255.0;
+        return (sf::Uint8)x;
+    };
+    return sf::Color(cl(r), cl(g), cl(b));
+}
+
+sf::Color colorFromPlanet(const Body& b) {
+    sf::Color base;
+    if (b.category == BodyCategory::Rocky)
+        base = sf::Color(150, 120, 90);
+    else if (b.category == BodyCategory::Oceanic)
+        base = sf::Color(60, 110, 170);
+    else if (b.category == BodyCategory::GasGiant)
+        base = sf::Color(200, 170, 120);
+    else if (b.category == BodyCategory::IceGiant)
+        base = sf::Color(100, 150, 220);
+    else
+        base = sf::Color(160, 160, 160);
+
+    double T = b.temperatureK;
+    double factor = std::clamp((T - 100.0) / 400.0, 0.6, 1.4);
+    auto cl = [&](int c) {
+        double v = c * factor;
+        if (v < 0.0) v = 0.0;
+        if (v > 255.0) v = 255.0;
+        return (sf::Uint8)v;
+    };
+    return sf::Color(cl(base.r), cl(base.g), cl(base.b));
+}
+
+sf::Color bodyColor(const Body& b) {
+    return isStar(b) ? colorFromStarTemp(b.temperatureK)
+                     : colorFromPlanet(b);
+}
+
+void updatePlanetCategoryFromComp(Body& b) {
+    if (isStar(b)) return;
+
+    double rockLike   = b.bulk.rock + b.bulk.metal;
+    double waterLike  = b.bulk.water;
+    double iceLike    = b.bulk.ice;
+    double gasLike    = b.bulk.gas;
+
+    if (gasLike > 0.6 && b.mass > 10.0 * M_EARTH) {
+        b.category = BodyCategory::GasGiant;
+        b.typeInfo = gasType;
+        b.albedo   = 0.4;
+    } else if ((iceLike + waterLike > 0.6) && b.mass > 5.0 * M_EARTH) {
+        b.category = BodyCategory::IceGiant;
+        b.typeInfo = iceType;
+        b.albedo   = 0.5;
+    } else if (waterLike > 0.4) {
+        b.category = BodyCategory::Oceanic;
+        b.typeInfo = oceanType;
+        b.albedo   = 0.3;
+    } else {
+        b.category = BodyCategory::Rocky;
+        b.typeInfo = rockyType;
+        b.albedo   = 0.25;
+    }
+
+    b.color = bodyColor(b);
+}
+
+// Map detailed subcomponents into bulk categories
+void recomputeBulkComposition(Body& b) {
+    b.bulk = {};
+    double sum = 0.0;
+    for (const auto& sc : b.sub) sum += sc.fraction;
+    if (sum <= 0.0) return;
+
+    for (const auto& sc : b.sub) {
+        double f = sc.fraction / sum;
+        std::string n = sc.name;
+        if (n == "Silicate rock")         b.bulk.rock  += f;
+        else if (n == "Iron")             b.bulk.metal += f;
+        else if (n == "Water")            b.bulk.water += f;
+        else if (n == "Ice")              b.bulk.ice   += f;
+        else if (n == "Hydrogen" ||
+                 n == "Helium"   ||
+                 n == "Nitrogen" ||
+                 n == "Oxygen"   ||
+                 n == "CO2"      ||
+                 n == "Methane"  ||
+                 n == "Argon"    ||
+                 n == "Metals")           b.bulk.gas   += f;
+        else                               b.bulk.rock  += f * 0.5;
+    }
+
+    if (!isStar(b))
+        updatePlanetCategoryFromComp(b);
+}
+
+// --------------------
+// Integrator
 // --------------------
 void stepSim(std::vector<Body>& bodies, double dtRealSeconds) {
     double dt = dtRealSeconds * timeScale;
 
-    for (auto& b : bodies) {
-        if (!b.fixed && !b.ghost) {
+    for (auto& b : bodies)
+        if (!b.fixed && !b.ghost)
             b.velocity += b.acceleration * dt;
-        }
-    }
-    for (auto& b : bodies) {
-        if (!b.fixed && !b.ghost) {
+    for (auto& b : bodies)
+        if (!b.fixed && !b.ghost)
             b.position += b.velocity * dt;
-        }
-    }
 
     computeGravity(bodies);
     updateTemperatures(bodies);
@@ -289,6 +400,76 @@ void stepSim(std::vector<Body>& bodies, double dtRealSeconds) {
 }
 
 // --------------------
+// Parent selection
+// --------------------
+int findStrongestInfluenceParent(const std::vector<Body>& bodies,
+                                 const Vec2& posMeters)
+{
+    int bestIndex = -1;
+    double bestAccel = -1.0;
+    for (std::size_t i = 0; i < bodies.size(); ++i) {
+        const Body& b = bodies[i];
+        if (b.ghost) continue;
+        Vec2 r = b.position - posMeters;
+        double dist2 = r.x * r.x + r.y * r.y;
+        if (dist2 <= 0.0) continue;
+        double accel = G_PHYS * b.mass / dist2;
+        if (accel > bestAccel) {
+            bestAccel = accel;
+            bestIndex = (int)i;
+        }
+    }
+    return bestIndex;
+}
+
+// use star + Hill sphere so moons attach to planets
+int chooseOrbitParent(const std::vector<Body>& bodies,
+                      const Vec2& posMeters)
+{
+    int starIndex = -1;
+    double starMass = 0.0;
+    for (int i = 0; i < (int)bodies.size(); ++i) {
+        if (isStar(bodies[i]) && bodies[i].mass > starMass) {
+            starMass = bodies[i].mass;
+            starIndex = i;
+        }
+    }
+
+    if (starIndex >= 0) {
+        int bestPlanet = -1;
+        double bestDist = 1e99;
+
+        const Body& star = bodies[starIndex];
+
+        for (int i = 0; i < (int)bodies.size(); ++i) {
+            if (i == starIndex) continue;
+            const Body& p = bodies[i];
+
+            Vec2 rsp = p.position - star.position;
+            double a_p = length(rsp);
+            if (a_p <= 0.0) continue;
+
+            double mu = p.mass / (3.0 * star.mass);
+            if (mu <= 0.0) continue;
+            double rH = a_p * std::cbrt(mu);   // Hill radius
+
+            Vec2 rb = posMeters - p.position;
+            double dist = length(rb);
+            if (dist < 0.6 * rH && dist < bestDist) {
+                bestDist = dist;
+                bestPlanet = i;
+            }
+        }
+
+        if (bestPlanet >= 0) return bestPlanet;
+        return starIndex;
+    }
+
+    // fallback when no star is defined
+    return findStrongestInfluenceParent(bodies, posMeters);
+}
+
+// --------------------
 // Interaction modes
 // --------------------
 enum class InteractionMode {
@@ -298,7 +479,9 @@ enum class InteractionMode {
     OrbitEdit
 };
 
-int findNearestBody(const std::vector<Body>& bodies, const Vec2& pointMeters, double maxDistMeters) {
+int findNearestBody(const std::vector<Body>& bodies,
+                    const Vec2& pointMeters,
+                    double maxDistMeters) {
     int bestIndex = -1;
     double bestDist2 = maxDistMeters * maxDistMeters;
     for (std::size_t i = 0; i < bodies.size(); ++i) {
@@ -312,25 +495,9 @@ int findNearestBody(const std::vector<Body>& bodies, const Vec2& pointMeters, do
     }
     return bestIndex;
 }
-int findStrongestInfluenceParent(const std::vector<Body>& bodies, const Vec2& posMeters) {
-    int bestIndex = -1;
-    double bestAccel = 0.0;
-    for (std::size_t i = 0; i < bodies.size(); ++i) {
-        if (bodies[i].ghost) continue;
-        Vec2 r = bodies[i].position - posMeters;
-        double dist2 = r.x*r.x + r.y*r.y;
-        if (dist2 <= 0.0) continue;
-        double accel = G_PHYS * bodies[i].mass / dist2;
-        if (accel > bestAccel) {
-            bestAccel = accel;
-            bestIndex = (int)i;
-        }
-    }
-    return bestIndex;
-}
 
 // --------------------
-// Panels (body editor, controls)
+// Panels
 // --------------------
 struct Panel {
     bool visible   = false;
@@ -340,6 +507,7 @@ struct Panel {
     bool dragging  = false;
     sf::Vector2f dragOffset{0.f, 0.f};
 };
+
 bool pointInRect(const sf::Vector2f& p, const sf::FloatRect& r) {
     return r.contains(p);
 }
@@ -350,21 +518,17 @@ bool pointInRect(const sf::Vector2f& p, const sf::FloatRect& r) {
 enum class OrbitHandle { None, Body, Pe, Ap };
 
 struct OrbitEditState {
-    bool active = false;
-    int  bodyIndex   = -1;
-    int  parentIndex = -1;
-
+    bool   active = false;
+    int    bodyIndex   = -1;
+    int    parentIndex = -1;
     double a  = 0.0;
     double e  = 0.0;
     double nu = 0.0;
-
-    Vec2 u{1.0, 0.0};
-    Vec2 v{0.0, 1.0};
-
+    Vec2   u{1.0, 0.0};
+    Vec2   v{0.0, 1.0};
     OrbitHandle dragHandle = OrbitHandle::None;
-    bool dragging = false;
+    bool   dragging = false;
 };
-
 OrbitEditState orbitEdit;
 
 double getRpe() { return orbitEdit.a * (1.0 - orbitEdit.e); }
@@ -374,7 +538,6 @@ void updateBodyFromOrbit(Body& body, const Body& parent) {
     double a  = orbitEdit.a;
     double e  = orbitEdit.e;
     double nu = orbitEdit.nu;
-
     double cosnu = std::cos(nu);
     double sinnu = std::sin(nu);
     double denom = 1.0 + e * cosnu;
@@ -382,7 +545,8 @@ void updateBodyFromOrbit(Body& body, const Body& parent) {
     double r = a * (1.0 - e*e) / denom;
 
     Vec2 rel = orbitEdit.u * (r * cosnu) + orbitEdit.v * (r * sinnu);
-    body.position = { parent.position.x + rel.x, parent.position.y + rel.y };
+    body.position = { parent.position.x + rel.x,
+                      parent.position.y + rel.y };
 
     double mu = G_PHYS * (body.mass + parent.mass);
     double vmag = std::sqrt(std::max(0.0, mu * (2.0 / r - 1.0 / a)));
@@ -394,11 +558,11 @@ void updateBodyFromOrbit(Body& body, const Body& parent) {
 }
 
 void initOrbitEdit(int bodyIdx, int parentIdx, std::vector<Body>& bodies) {
-    orbitEdit.active      = true;
-    orbitEdit.bodyIndex   = bodyIdx;
+    orbitEdit.active = true;
+    orbitEdit.bodyIndex = bodyIdx;
     orbitEdit.parentIndex = parentIdx;
-    orbitEdit.dragging    = false;
-    orbitEdit.dragHandle  = OrbitHandle::None;
+    orbitEdit.dragging = false;
+    orbitEdit.dragHandle = OrbitHandle::None;
 
     Body& body   = bodies[bodyIdx];
     Body& parent = bodies[parentIdx];
@@ -446,13 +610,12 @@ bool computeOrbitGeom(const Body& parent, OrbitGeom& out) {
     return true;
 }
 
-OrbitHandle pickOrbitHandle(
-    const Body& body,
-    const Body& parent,
-    const sf::Vector2f& mouseScreen,
-    double width,
-    double height
-) {
+OrbitHandle pickOrbitHandle(const Body& body,
+                            const Body& parent,
+                            const sf::Vector2f& mouseScreen,
+                            double width,
+                            double height)
+{
     OrbitGeom geom;
     if (!computeOrbitGeom(parent, geom)) return OrbitHandle::None;
 
@@ -491,6 +654,7 @@ void applyOrbitDrag(Body& body, Body& parent, const Vec2& mouseWorld) {
         orbitEdit.nu = angleMouse;
     } else if (orbitEdit.dragHandle == OrbitHandle::Pe ||
                orbitEdit.dragHandle == OrbitHandle::Ap) {
+
         orbitEdit.u = relMouse; normalize(orbitEdit.u);
         orbitEdit.v = { -orbitEdit.u.y, orbitEdit.u.x };
 
@@ -519,8 +683,8 @@ void applyOrbitDrag(Body& body, Body& parent, const Vec2& mouseWorld) {
 
         orbitEdit.a = 0.5 * (r_pe_new + r_ap_new);
         orbitEdit.e = (r_ap_new - r_pe_new) / (r_ap_new + r_pe_new);
-        if (orbitEdit.e < 0.0)   orbitEdit.e = 0.0;
-        if (orbitEdit.e > 0.99)  orbitEdit.e = 0.99;
+        if (orbitEdit.e < 0.0)  orbitEdit.e = 0.0;
+        if (orbitEdit.e > 0.99) orbitEdit.e = 0.99;
 
         orbitEdit.nu = angleMouse;
     }
@@ -529,69 +693,134 @@ void applyOrbitDrag(Body& body, Body& parent, const Vec2& mouseWorld) {
 }
 
 // --------------------
-// Colour functions
+// Draw helpers
 // --------------------
-sf::Color colorFromStarTemp(double T) {
-    // very crude Kelvin -> RGB approximation
-    T = std::clamp(T, 2000.0, 40000.0);
-    double t = T / 100.0;
-
-    double r, g, b;
-    // based on Tanner Helland's approximation
-    if (t <= 66.0) {
-        r = 255.0;
-        g = 99.4708025861 * std::log(t) - 161.1195681661;
-        if (t <= 19.0)
-            b = 0.0;
-        else {
-            b = 138.5177312231 * std::log(t - 10.0) - 305.0447927307;
-        }
-    } else {
-        r = 329.698727446 * std::pow(t - 60.0, -0.1332047592);
-        g = 288.1221695283 * std::pow(t - 60.0, -0.0755148492);
-        b = 255.0;
+void drawDashedLine(sf::RenderWindow& window,
+                    const sf::Vector2f& A,
+                    const sf::Vector2f& B,
+                    sf::Color col = sf::Color::White) {
+    const float dashLen = 8.f;
+    const float gapLen  = 4.f;
+    sf::Vector2f d = B - A;
+    float len = std::sqrt(d.x*d.x + d.y*d.y);
+    if (len <= 0.f) return;
+    sf::Vector2f dir = d / len;
+    float pos = 0.f;
+    while (pos < len) {
+        float seg = std::min(dashLen, len - pos);
+        sf::Vector2f s = A + dir * pos;
+        sf::Vector2f e = A + dir * (pos + seg);
+        sf::Vertex line[] = { sf::Vertex(s, col), sf::Vertex(e, col) };
+        window.draw(line, 2, sf::Lines);
+        pos += dashLen + gapLen;
     }
-    auto clamp255 = [](double x) {
-        if (x < 0.0) x = 0.0;
-        if (x > 255.0) x = 255.0;
-        return (sf::Uint8)x;
-    };
-    return sf::Color(clamp255(r), clamp255(g), clamp255(b));
 }
 
-sf::Color colorFromPlanet(const Body& b) {
-    // base hues by category / composition
-    sf::Color base;
+// orbit overlay
+void drawOrbitOverlay(sf::RenderWindow& window,
+                      const Body& body,
+                      const Body& parent,
+                      double WIDTH,
+                      double HEIGHT,
+                      const sf::Font& font) {
+    if (!orbitEdit.active) return;
 
-    if (b.category == BodyCategory::Rocky) {
-        base = sf::Color(150, 120, 90);
-    } else if (b.category == BodyCategory::Oceanic) {
-        base = sf::Color(60, 110, 170);
-    } else if (b.category == BodyCategory::GasGiant) {
-        base = sf::Color(200, 170, 120);
-    } else if (b.category == BodyCategory::IceGiant) {
-        base = sf::Color(100, 150, 220);
-    } else {
-        base = sf::Color(150, 150, 150);
+    OrbitGeom geom;
+    if (!computeOrbitGeom(parent, geom)) return;
+
+    const int SEG = 256;
+    std::vector<sf::Vertex> line;
+    line.reserve(SEG + 1);
+    for (int i = 0; i <= SEG; ++i) {
+        double th = (double)i / SEG * 2.0 * 3.141592653589793;
+        double cosT = std::cos(th);
+        double sinT = std::sin(th);
+        double denom = 1.0 + geom.e * cosT;
+        if (denom <= 0.0) denom = 1e-6;
+        double r = geom.a * (1.0 - geom.e*geom.e) / denom;
+        Vec2 rel = geom.u * (r * cosT) + geom.v * (r * sinT);
+        Vec2 pWorld{ geom.parentPos.x + rel.x,
+                     geom.parentPos.y + rel.y };
+        line.emplace_back(worldToScreen(pWorld, WIDTH, HEIGHT),
+                          sf::Color(0, 150, 255));
     }
+    window.draw(line.data(), line.size(), sf::LineStrip);
 
-    // modulate brightness with temperature (warmer -> slightly brighter)
-    double T = b.temperatureK;
-    double factor = std::clamp((T - 100.0) / 400.0, 0.6, 1.4);
-    auto cl = [&](int c) {
-        double v = c * factor;
-        if (v < 0.0) v = 0.0;
-        if (v > 255.0) v = 255.0;
-        return (sf::Uint8)v;
-    };
-    return sf::Color(cl(base.r), cl(base.g), cl(base.b));
-}
+    sf::Vector2f parentScreen = worldToScreen(geom.parentPos, WIDTH, HEIGHT);
+    sf::CircleShape parentPt(4.f);
+    parentPt.setOrigin(4.f, 4.f);
+    parentPt.setPosition(parentScreen);
+    parentPt.setFillColor(sf::Color::Red);
+    window.draw(parentPt);
 
-sf::Color bodyColor(const Body& b) {
-    if (isStar(b)) {
-        return colorFromStarTemp(b.temperatureK);
-    } else {
-        return colorFromPlanet(b);
+    sf::Vector2f peScreen = worldToScreen(geom.peWorld, WIDTH, HEIGHT);
+    sf::Vector2f apScreen = worldToScreen(geom.apWorld, WIDTH, HEIGHT);
+
+    sf::CircleShape pePt(4.f), apPt(4.f);
+    pePt.setOrigin(4.f, 4.f);
+    apPt.setOrigin(4.f, 4.f);
+    pePt.setPosition(peScreen);
+    apPt.setPosition(apScreen);
+    pePt.setFillColor(sf::Color(255, 100, 200));
+    apPt.setFillColor(sf::Color(255, 100, 200));
+    window.draw(pePt);
+    window.draw(apPt);
+
+    drawDashedLine(window, parentScreen, peScreen);
+    drawDashedLine(window, parentScreen, apScreen);
+
+    if (!font.getInfo().family.empty()) {
+        sf::Text text;
+        text.setFont(font);
+        text.setCharacterSize(12);
+
+        text.setFillColor(sf::Color(255, 100, 200));
+        text.setString("Pe");
+        text.setPosition(peScreen.x + 6.f, peScreen.y - 4.f);
+        window.draw(text);
+        text.setString("Ap");
+        text.setPosition(apScreen.x + 6.f, apScreen.y - 4.f);
+        window.draw(text);
+
+        double rPe = getRpe();
+        double rAp = getRap();
+        sf::Vector2f midPe = (parentScreen + peScreen) * 0.5f;
+        sf::Vector2f midAp = (parentScreen + apScreen) * 0.5f;
+
+        text.setFillColor(sf::Color::White);
+        text.setPosition(midPe.x + 4.f, midPe.y - 12.f);
+        text.setString("r(Pe) = " + formatDistance(rPe));
+        window.draw(text);
+
+        text.setPosition(midAp.x + 4.f, midAp.y - 12.f);
+        text.setString("r(Ap) = " + formatDistance(rAp));
+        window.draw(text);
+
+        // true anomaly & period
+        Vec2 relBody{ body.position.x - geom.parentPos.x,
+                      body.position.y - geom.parentPos.y };
+        double r = length(relBody); if (r <= 0.0) r = 1.0;
+        Vec2 rhat = relBody; normalize(rhat);
+        double c = dot(rhat, geom.u);
+        double s = dot(rhat, geom.v);
+        double nuDeg = std::atan2(s, c) * 180.0 / 3.141592653589793;
+
+        char buf[64];
+        sf::Vector2f bodyScreen = worldToScreen(body.position, WIDTH, HEIGHT);
+        text.setFillColor(sf::Color::Green);
+        std::snprintf(buf, sizeof(buf), "nu = %.2f°", nuDeg);
+        text.setString(buf);
+        text.setPosition(bodyScreen.x + 8.f, bodyScreen.y - 20.f);
+        window.draw(text);
+
+        double mu = G_PHYS * (body.mass + parent.mass);
+        double T = 2.0 * 3.141592653589793 * std::sqrt(geom.a*geom.a*geom.a / mu);
+        double T_years = T / YEAR_SECONDS;
+        text.setFillColor(sf::Color(0, 180, 255));
+        std::snprintf(buf, sizeof(buf), "P = %.3f yr", T_years);
+        text.setString(buf);
+        text.setPosition(parentScreen.x - 40.f, parentScreen.y + 30.f);
+        window.draw(text);
     }
 }
 
@@ -605,7 +834,6 @@ struct ResetPopup {
 };
 ResetPopup resetPopup;
 
-// scale/time formatting
 std::string formatScale() {
     return formatDistance(metersPerPixel) + " / px";
 }
@@ -619,12 +847,15 @@ std::string formatTimeScaleStr() {
 // --------------------
 // Reset system helper
 // --------------------
-void resetSystem(std::vector<Body>& bodies, Body& star) {
+void resetSystem(std::vector<Body>& bodies, Body& starProto) {
     bodies.clear();
+    Body star = starProto;
     star.position = {0.0, 0.0};
     star.velocity = {0.0, 0.0};
     star.fixed    = true;
     star.ghost    = false;
+    updateStarFromMass(star);
+    star.color = bodyColor(star);
     bodies.push_back(star);
     computeGravity(bodies);
     updateTemperatures(bodies);
@@ -635,155 +866,45 @@ void resetSystem(std::vector<Body>& bodies, Body& star) {
 }
 
 // --------------------
-// Draw dashed line helper
+// Body panel controls / rects
 // --------------------
-void drawDashedLine(sf::RenderWindow& window,
-                    const sf::Vector2f& A,
-                    const sf::Vector2f& B,
-                    sf::Color col = sf::Color::White) {
-    const float dashLen = 8.0f;
-    const float gapLen  = 4.0f;
-    sf::Vector2f d = B - A;
-    float len = std::sqrt(d.x*d.x + d.y*d.y);
-    if (len <= 0.0f) return;
-    sf::Vector2f dir = d / len;
-    float pos = 0.0f;
-    while (pos < len) {
-        float seg = std::min(dashLen, len - pos);
-        sf::Vector2f s = A + dir * pos;
-        sf::Vector2f e = A + dir * (pos + seg);
-        sf::Vertex line[] = {
-            sf::Vertex(s, col),
-            sf::Vertex(e, col)
-        };
-        window.draw(line, 2, sf::Lines);
-        pos += dashLen + gapLen;
+struct BodyPanelControls {
+    bool valid = false;
+    sf::FloatRect compRock;
+    sf::FloatRect compMetal;
+    sf::FloatRect compIce;
+    sf::FloatRect compGas;
+    sf::FloatRect compWater;
+};
+BodyPanelControls bodyPanelControls;
+std::vector<sf::FloatRect> subCompRects; // detailed composition rows
+
+void setPrimaryComposition(Body& b, const std::string& which) {
+    if (isStar(b)) {
+        if (which == "Gas") {
+            b.bulk = {0,0,0,1.0,0};
+        } else if (which == "Metal") {
+            b.bulk = {0,1.0,0,0,0};
+        }
+        updatePlanetCategoryFromComp(b);
+        return;
     }
-}
 
-// --------------------
-// Orbit overlay drawing
-// --------------------
-void drawOrbitOverlay(
-    sf::RenderWindow& window,
-    const Body& body,
-    const Body& parent,
-    double WIDTH,
-    double HEIGHT,
-    const sf::Font& font
-) {
-    if (!orbitEdit.active) return;
+    b.bulk = {};
+    if (which == "Rock")      b.bulk.rock  = 1.0;
+    else if (which == "Metal") b.bulk.metal = 1.0;
+    else if (which == "Ice")   b.bulk.ice   = 1.0;
+    else if (which == "Gas")   b.bulk.gas   = 1.0;
+    else if (which == "Water") b.bulk.water = 1.0;
 
-    OrbitGeom geom;
-    if (!computeOrbitGeom(parent, geom)) return;
-
-    // ellipse line
-    const int SEG = 256;
-    std::vector<sf::Vertex> orbitLine;
-    orbitLine.reserve(SEG + 1);
-
-    for (int i = 0; i <= SEG; ++i) {
-        double th = (double)i / SEG * 2.0 * 3.141592653589793;
-        double cosT = std::cos(th);
-        double sinT = std::sin(th);
-        double denom = 1.0 + geom.e * cosT;
-        if (denom <= 0.0) denom = 1e-6;
-        double r = geom.a * (1.0 - geom.e*geom.e) / denom;
-        Vec2 rel = geom.u * (r * cosT) + geom.v * (r * sinT);
-        Vec2 pWorld{ geom.parentPos.x + rel.x, geom.parentPos.y + rel.y };
-        orbitLine.emplace_back(worldToScreen(pWorld, WIDTH, HEIGHT),
-                               sf::Color(0, 150, 255));
-    }
-    window.draw(orbitLine.data(), orbitLine.size(), sf::LineStrip);
-
-    sf::Vector2f parentScreen = worldToScreen(geom.parentPos, WIDTH, HEIGHT);
-    sf::CircleShape parentPt(4.f);
-    parentPt.setOrigin(4.f, 4.f);
-    parentPt.setPosition(parentScreen);
-    parentPt.setFillColor(sf::Color::Red);
-    window.draw(parentPt);
-
-    sf::Vector2f peScreen = worldToScreen(geom.peWorld, WIDTH, HEIGHT);
-    sf::Vector2f apScreen = worldToScreen(geom.apWorld, WIDTH, HEIGHT);
-
-    sf::CircleShape pePt(4.f);
-    pePt.setOrigin(4.f, 4.f);
-    pePt.setPosition(peScreen);
-    pePt.setFillColor(sf::Color(255, 100, 200));
-    window.draw(pePt);
-
-    sf::CircleShape apPt(4.f);
-    apPt.setOrigin(4.f, 4.f);
-    apPt.setPosition(apScreen);
-    apPt.setFillColor(sf::Color(255, 100, 200));
-    window.draw(apPt);
-
-    drawDashedLine(window, parentScreen, peScreen);
-    drawDashedLine(window, parentScreen, apScreen);
-
-    if (font.getInfo().family.empty()) return;
-
-    sf::Text text;
-    text.setFont(font);
-    text.setCharacterSize(12);
-
-    // Pe/Ap labels
-    text.setFillColor(sf::Color(255, 100, 200));
-    text.setString("Pe");
-    text.setPosition(peScreen.x + 6.f, peScreen.y - 4.f);
-    window.draw(text);
-
-    text.setString("Ap");
-    text.setPosition(apScreen.x + 6.f, apScreen.y - 4.f);
-    window.draw(text);
-
-    // distances at Pe / Ap (from center)
-    double rPe = getRpe();
-    double rAp = getRap();
-    sf::Vector2f midPe = (parentScreen + peScreen) * 0.5f;
-    sf::Vector2f midAp = (parentScreen + apScreen) * 0.5f;
-
-    text.setFillColor(sf::Color::White);
-    text.setPosition(midPe.x + 4.f, midPe.y - 12.f);
-    text.setString("r(Pe) = " + formatDistance(rPe));
-    window.draw(text);
-
-    text.setPosition(midAp.x + 4.f, midAp.y - 12.f);
-    text.setString("r(Ap) = " + formatDistance(rAp));
-    window.draw(text);
-
-    // true anomaly & period
-    Vec2 relBody{ body.position.x - geom.parentPos.x,
-                  body.position.y - geom.parentPos.y };
-    double r = length(relBody); if (r <= 0.0) r = 1.0;
-    Vec2 rhat = relBody; normalize(rhat);
-    double c = dot(rhat, geom.u);
-    double s = dot(rhat, geom.v);
-    double nuDeg = std::atan2(s, c) * 180.0 / 3.141592653589793;
-
-    char buf[64];
-    sf::Vector2f bodyScreen = worldToScreen(body.position, WIDTH, HEIGHT);
-    text.setFillColor(sf::Color::Green);
-    std::snprintf(buf, sizeof(buf), "ν = %.2f°", nuDeg);
-    text.setString(buf);
-    text.setPosition(bodyScreen.x + 8.f, bodyScreen.y - 20.f);
-    window.draw(text);
-
-    double mu = G_PHYS * (body.mass + parent.mass);
-    double T = 2.0 * 3.141592653589793 * std::sqrt(geom.a*geom.a*geom.a / mu);
-    double T_years = T / YEAR_SECONDS;
-    text.setFillColor(sf::Color(0, 180, 255));
-    std::snprintf(buf, sizeof(buf), "P = %.3f yr", T_years);
-    text.setString(buf);
-    text.setPosition(parentScreen.x - 40.f, parentScreen.y + 30.f);
-    window.draw(text);
+    updatePlanetCategoryFromComp(b);
 }
 
 // --------------------
 // main
 // --------------------
 int main() {
-    const unsigned int WIDTH  = 1280;
+    const unsigned int WIDTH = 1280;
     const unsigned int HEIGHT = 720;
 
     sf::RenderWindow window(sf::VideoMode(WIDTH, HEIGHT), "PlanetSim.exe");
@@ -791,25 +912,31 @@ int main() {
 
     std::vector<Body> bodies;
 
-    // star
-    Body star;
-    star.mass        = M_SUN;
-    star.position    = {0.0, 0.0};
-    star.velocity    = {0.0, 0.0};
-    star.fixed       = true;
-    star.density     = 1.0;
-    star.radius      = 18.0;
-    star.name        = "Sol";
-    star.category    = BodyCategory::Star;
-    star.typeInfo    = starType;
-    star.temperatureK = 5800.0;
-    star.luminosityW  = 3.828e26;
-    star.comp.gas     = 0.9;
-    star.comp.metal   = 0.1;
-    star.albedo       = 0.0;
-    star.color        = bodyColor(star);
+    // prototype star (for reset)
+    Body starProto;
+    starProto.mass        = M_SUN;
+    starProto.position    = {0.0, 0.0};
+    starProto.velocity    = {0.0, 0.0};
+    starProto.fixed       = true;
+    starProto.density     = 1.0;
+    starProto.radius      = 18.0;
+    starProto.name        = "Sol";
+    starProto.category    = BodyCategory::Star;
+    starProto.typeInfo    = starType;
+    starProto.temperatureK = 5800.0;
+    starProto.luminosityW  = 3.828e26;
+    starProto.albedo       = 0.0;
 
-    bodies.push_back(star);
+    starProto.sub = {
+        {"Hydrogen", 0.70},
+        {"Helium",   0.28},
+        {"Metals",   0.02}
+    };
+    recomputeBulkComposition(starProto);
+    updateStarFromMass(starProto);
+    starProto.color = bodyColor(starProto);
+
+    bodies.push_back(starProto);
     computeGravity(bodies);
     updateTemperatures(bodies);
 
@@ -825,42 +952,38 @@ int main() {
 
     Panel bodyPanel;
     bodyPanel.pos  = {20.f, 80.f};
-    bodyPanel.size = {280.f, 210.f};
+    bodyPanel.size = {360.f, 280.f};
 
     Panel controlsPanel;
     controlsPanel.pos  = {WIDTH - 380.f, 10.f};
-    controlsPanel.size = {360.f, 210.f};
+    controlsPanel.size = {360.f, 260.f};
     controlsPanel.visible = true;
 
     bool renaming = false;
     std::string renameBuffer;
 
-    viewCenterWorld = star.position;
+    viewCenterWorld = starProto.position;
 
     while (window.isOpen()) {
         sf::Event event;
         while (window.pollEvent(event)) {
-            // ------------- events -------------
+
             if (event.type == sf::Event::Closed) {
                 window.close();
             }
             else if (event.type == sf::Event::KeyPressed) {
-                // Ctrl+R reset popup
                 if (event.key.code == sf::Keyboard::R && event.key.control) {
                     resetPopup.visible = true;
                 }
-                // toggle controls panel with '?'
                 else if (event.key.code == sf::Keyboard::Slash && event.key.shift) {
                     controlsPanel.visible = !controlsPanel.visible;
                 }
-                // Esc: close dialogs / rename / orbit edit
                 else if (event.key.code == sf::Keyboard::Escape) {
                     if (resetPopup.visible) {
                         resetPopup.visible = false;
                     } else if (renaming) {
                         renaming = false;
-                    } else if (mode == InteractionMode::OrbitEdit &&
-                               orbitEdit.active &&
+                    } else if (mode == InteractionMode::OrbitEdit && orbitEdit.active &&
                                orbitEdit.bodyIndex >= 0 &&
                                orbitEdit.bodyIndex < (int)bodies.size()) {
                         bodies.erase(bodies.begin() + orbitEdit.bodyIndex);
@@ -871,7 +994,6 @@ int main() {
                         mode = InteractionMode::AddOrbitingPlace;
                     }
                 }
-                // Enter to commit orbit
                 else if ((event.key.code == sf::Keyboard::Enter ||
                           event.key.code == sf::Keyboard::Return) &&
                          mode == InteractionMode::OrbitEdit &&
@@ -885,7 +1007,6 @@ int main() {
                     mode = InteractionMode::AddOrbitingPlace;
                 }
                 else if (!resetPopup.visible) {
-                    // mode keys
                     if (event.key.code == sf::Keyboard::Num1)
                         mode = InteractionMode::AddStill;
                     else if (event.key.code == sf::Keyboard::Num2)
@@ -902,14 +1023,24 @@ int main() {
                     }
                     else if (event.key.code == sf::Keyboard::Up) {
                         if (selectedIndex >= 0) {
-                            bodies[selectedIndex].mass *= 1.2;
-                            updateBodyAfterMassChange(bodies[selectedIndex]);
+                            Body& b = bodies[selectedIndex];
+                            b.mass *= 1.2;
+                            updateBodyAfterMassChange(b);
+                            if (isStar(b)) {
+                                updateStarFromMass(b);
+                                b.color = bodyColor(b);
+                            }
                         }
                     }
                     else if (event.key.code == sf::Keyboard::Down) {
                         if (selectedIndex >= 0) {
-                            bodies[selectedIndex].mass *= 0.8;
-                            updateBodyAfterMassChange(bodies[selectedIndex]);
+                            Body& b = bodies[selectedIndex];
+                            b.mass *= 0.8;
+                            updateBodyAfterMassChange(b);
+                            if (isStar(b)) {
+                                updateStarFromMass(b);
+                                b.color = bodyColor(b);
+                            }
                         }
                     }
                     else if (event.key.code == sf::Keyboard::T) {
@@ -941,7 +1072,6 @@ int main() {
                             renameBuffer = bodies[selectedIndex].name;
                         }
                     }
-                    // zoom + time
                     else if (event.key.code == sf::Keyboard::I) {
                         metersPerPixel *= 0.5;
                         if (metersPerPixel < 1.0e7) metersPerPixel = 1.0e7;
@@ -960,7 +1090,6 @@ int main() {
                     }
                 }
             }
-            // rename text
             else if (event.type == sf::Event::TextEntered && renaming) {
                 if (event.text.unicode == '\r' || event.text.unicode == '\n') {
                     if (selectedIndex >= 0) bodies[selectedIndex].name = renameBuffer;
@@ -971,7 +1100,6 @@ int main() {
                     renameBuffer.push_back(static_cast<char>(event.text.unicode));
                 }
             }
-            // mouse pressed
             else if (event.type == sf::Event::MouseButtonPressed) {
                 sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
 
@@ -979,57 +1107,120 @@ int main() {
                 if (resetPopup.visible && event.mouseButton.button == sf::Mouse::Left) {
                     if (resetPopup.yesRect.contains(mouseScreenF)) {
                         resetPopup.visible = false;
-                        resetSystem(bodies, star);
+                        resetSystem(bodies, starProto);
                     } else if (resetPopup.noRect.contains(mouseScreenF)) {
                         resetPopup.visible = false;
                     }
                     continue;
                 }
 
-                // panel handling (body)
-                auto handlePanelClick = [&](Panel& p, bool allowClose) -> bool {
-                    if (!p.visible) return false;
-                    sf::FloatRect panelRect(p.pos, p.size);
-                    sf::FloatRect titleRect(p.pos.x, p.pos.y, p.size.x, 24.f);
+                // ----- Body panel handling -----
+                if (bodyPanel.visible) {
+                    sf::FloatRect panelRect(bodyPanel.pos, bodyPanel.size);
+                    sf::FloatRect titleRect(bodyPanel.pos.x, bodyPanel.pos.y,
+                                            bodyPanel.size.x, 24.f);
+
+                    if (event.mouseButton.button == sf::Mouse::Left ||
+                        event.mouseButton.button == sf::Mouse::Right) {
+                        if (titleRect.contains(mouseScreenF)) {
+                            float btn = 16.f;
+                            sf::FloatRect closeRect(
+                                bodyPanel.pos.x + bodyPanel.size.x - btn - 4.f,
+                                bodyPanel.pos.y + 4.f, btn, btn);
+                            sf::FloatRect minRect(
+                                bodyPanel.pos.x + bodyPanel.size.x - 2.f*(btn+4.f),
+                                bodyPanel.pos.y + 4.f, btn, btn);
+                            if (closeRect.contains(mouseScreenF) &&
+                                event.mouseButton.button == sf::Mouse::Left) {
+                                bodyPanel.visible = false;
+                                selectedIndex = -1;
+                                continue;
+                            } else if (minRect.contains(mouseScreenF) &&
+                                       event.mouseButton.button == sf::Mouse::Left) {
+                                bodyPanel.minimized = !bodyPanel.minimized;
+                                continue;
+                            } else if (event.mouseButton.button == sf::Mouse::Left) {
+                                bodyPanel.dragging = true;
+                                bodyPanel.dragOffset = mouseScreenF - bodyPanel.pos;
+                                continue;
+                            }
+                        } else if (panelRect.contains(mouseScreenF)) {
+                            // content click: primary comp boxes
+                            if (selectedIndex >= 0 &&
+                                selectedIndex < (int)bodies.size() &&
+                                bodyPanelControls.valid &&
+                                event.mouseButton.button == sf::Mouse::Left) {
+
+                                Body& b = bodies[selectedIndex];
+                                if (bodyPanelControls.compRock.contains(mouseScreenF)) {
+                                    setPrimaryComposition(b, "Rock");
+                                } else if (bodyPanelControls.compMetal.contains(mouseScreenF)) {
+                                    setPrimaryComposition(b, "Metal");
+                                } else if (bodyPanelControls.compIce.contains(mouseScreenF)) {
+                                    setPrimaryComposition(b, "Ice");
+                                } else if (bodyPanelControls.compGas.contains(mouseScreenF)) {
+                                    setPrimaryComposition(b, "Gas");
+                                } else if (bodyPanelControls.compWater.contains(mouseScreenF)) {
+                                    setPrimaryComposition(b, "Water");
+                                }
+                            }
+
+                            // detailed subcomponents: left click +0.05, right click -0.05
+                            if (selectedIndex >= 0 &&
+                                selectedIndex < (int)bodies.size() &&
+                                !subCompRects.empty()) {
+
+                                Body& b = bodies[selectedIndex];
+                                for (std::size_t i = 0; i < subCompRects.size(); ++i) {
+                                    if (subCompRects[i].contains(mouseScreenF)) {
+                                        if (i >= b.sub.size()) break;
+                                        double delta = (event.mouseButton.button == sf::Mouse::Left)
+                                                       ? +0.05 : -0.05;
+                                        b.sub[i].fraction = std::clamp(b.sub[i].fraction + delta, 0.0, 1.0);
+                                        // normalize
+                                        double sum = 0.0;
+                                        for (auto& sc : b.sub) sum += sc.fraction;
+                                        if (sum > 0.0) {
+                                            for (auto& sc : b.sub) sc.fraction /= sum;
+                                        }
+                                        recomputeBulkComposition(b);
+                                        b.color = bodyColor(b);
+                                        break;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // ----- Controls panel -----
+                if (controlsPanel.visible) {
+                    sf::FloatRect titleRect(controlsPanel.pos.x, controlsPanel.pos.y,
+                                            controlsPanel.size.x, 24.f);
+                    sf::FloatRect panelRect(controlsPanel.pos, controlsPanel.size);
 
                     if (event.mouseButton.button == sf::Mouse::Left) {
                         if (titleRect.contains(mouseScreenF)) {
                             float btn = 16.f;
-                            sf::FloatRect closeRect(
-                                p.pos.x + p.size.x - btn - 4.f,
-                                p.pos.y + 4.f, btn, btn);
                             sf::FloatRect minRect(
-                                p.pos.x + p.size.x - 2.f*(btn+4.f),
-                                p.pos.y + 4.f, btn, btn);
-                            if (allowClose && closeRect.contains(mouseScreenF)) {
-                                p.visible = false;
-                                return true;
-                            } else if (minRect.contains(mouseScreenF)) {
-                                p.minimized = !p.minimized;
-                                return true;
+                                controlsPanel.pos.x + controlsPanel.size.x - (btn + 4.f),
+                                controlsPanel.pos.y + 4.f, btn, btn);
+                            if (minRect.contains(mouseScreenF)) {
+                                controlsPanel.minimized = !controlsPanel.minimized;
+                                continue;
                             } else {
-                                p.dragging = true;
-                                p.dragOffset = mouseScreenF - p.pos;
-                                return true;
+                                controlsPanel.dragging = true;
+                                controlsPanel.dragOffset = mouseScreenF - controlsPanel.pos;
+                                continue;
                             }
                         } else if (panelRect.contains(mouseScreenF)) {
-                            return true; // click absorbed
+                            continue; // absorb
                         }
                     }
-                    return false;
-                };
+                }
 
-                if (handlePanelClick(bodyPanel, true)) continue;
-                if (handlePanelClick(controlsPanel, false)) continue;
-
-                double cx = WIDTH * 0.5;
-                double cy = HEIGHT * 0.5;
-                Vec2 worldPos{
-                    (mouseScreenF.x - cx) * metersPerPixel + viewCenterWorld.x,
-                    (mouseScreenF.y - cy) * metersPerPixel + viewCenterWorld.y
-                };
-
-                // orbit handle pick
+                // ----- Orbit handle pick -----
                 if (mode == InteractionMode::OrbitEdit &&
                     event.mouseButton.button == sf::Mouse::Left &&
                     orbitEdit.active &&
@@ -1048,6 +1239,14 @@ int main() {
                     }
                 }
 
+                // ----- Main mouse logic -----
+                double cx = WIDTH * 0.5;
+                double cy = HEIGHT * 0.5;
+                Vec2 worldPos{
+                    (mouseScreenF.x - cx) * metersPerPixel + viewCenterWorld.x,
+                    (mouseScreenF.y - cy) * metersPerPixel + viewCenterWorld.y
+                };
+
                 if (event.mouseButton.button == sf::Mouse::Left) {
                     if (mode == InteractionMode::AddStill) {
                         Body b;
@@ -1059,9 +1258,19 @@ int main() {
                         b.velocity = {0.0, 0.0};
                         b.category = BodyCategory::Rocky;
                         b.typeInfo = rockyType;
-                        b.comp.rock = 0.7; b.comp.metal = 0.3;
-                        b.albedo   = 0.3;
+                        b.albedo   = 0.25;
                         b.name     = "Rocky body";
+                        b.sub = {
+                            {"Silicate rock", 0.67},
+                            {"Iron",          0.32},
+                            {"Water",         0.01},
+                            {"Nitrogen",      0.0},
+                            {"Oxygen",        0.0},
+                            {"CO2",           0.0},
+                            {"Methane",       0.0},
+                            {"Argon",         0.0}
+                        };
+                        recomputeBulkComposition(b);
                         b.color    = bodyColor(b);
                         bodies.push_back(b);
                         computeGravity(bodies);
@@ -1072,7 +1281,7 @@ int main() {
                         dragStart = worldPos;
                     }
                     else if (mode == InteractionMode::AddOrbitingPlace) {
-                        int parentIdx = findStrongestInfluenceParent(bodies, worldPos);
+                        int parentIdx = chooseOrbitParent(bodies, worldPos);
                         if (parentIdx >= 0) {
                             Body b;
                             b.mass     = M_EARTH;
@@ -1082,19 +1291,30 @@ int main() {
                             b.position = worldPos;
                             b.category = BodyCategory::Rocky;
                             b.typeInfo = rockyType;
-                            b.comp.rock = 0.7; b.comp.metal = 0.3;
-                            b.albedo   = 0.3;
+                            b.albedo   = 0.25;
                             b.name     = "Orbiting body";
                             b.ghost    = true;
+                            b.sub = {
+                                {"Silicate rock", 0.67},
+                                {"Iron",          0.32},
+                                {"Water",         0.01},
+                                {"Nitrogen",      0.0},
+                                {"Oxygen",        0.0},
+                                {"CO2",           0.0},
+                                {"Methane",       0.0},
+                                {"Argon",         0.0}
+                            };
+                            recomputeBulkComposition(b);
 
                             Body& parent = bodies[parentIdx];
                             Vec2 r = { worldPos.x - parent.position.x,
                                        worldPos.y - parent.position.y };
                             double dist = length(r);
                             if (dist < SOFTENING_METERS) dist = SOFTENING_METERS;
-                            double vmag = std::sqrt(G_PHYS * parent.mass / dist);
+
                             Vec2 rhat = r; normalize(rhat);
                             Vec2 perp{ -rhat.y, rhat.x };
+                            double vmag = std::sqrt(G_PHYS * parent.mass / dist);
                             b.velocity = { parent.velocity.x + perp.x * vmag,
                                            parent.velocity.y + perp.y * vmag };
                             b.color = bodyColor(b);
@@ -1118,13 +1338,12 @@ int main() {
                     }
                 }
             }
-            // mouse released
             else if (event.type == sf::Event::MouseButtonReleased) {
                 if (event.mouseButton.button == sf::Mouse::Left) {
                     bodyPanel.dragging = false;
                     controlsPanel.dragging = false;
                     if (orbitEdit.dragging) {
-                        orbitEdit.dragging   = false;
+                        orbitEdit.dragging = false;
                         orbitEdit.dragHandle = OrbitHandle::None;
                     }
                     if (mode == InteractionMode::AddMoving && isDraggingAddMoving) {
@@ -1148,9 +1367,19 @@ int main() {
                         b.velocity = vel;
                         b.category = BodyCategory::Rocky;
                         b.typeInfo = rockyType;
-                        b.comp.rock = 0.7; b.comp.metal = 0.3;
-                        b.albedo   = 0.3;
+                        b.albedo   = 0.25;
                         b.name     = "Moving body";
+                        b.sub = {
+                            {"Silicate rock", 0.67},
+                            {"Iron",          0.32},
+                            {"Water",         0.01},
+                            {"Nitrogen",      0.0},
+                            {"Oxygen",        0.0},
+                            {"CO2",           0.0},
+                            {"Methane",       0.0},
+                            {"Argon",         0.0}
+                        };
+                        recomputeBulkComposition(b);
                         b.color    = bodyColor(b);
                         bodies.push_back(b);
                         computeGravity(bodies);
@@ -1158,15 +1387,13 @@ int main() {
                     }
                 }
             }
-            // mouse moved
             else if (event.type == sf::Event::MouseMoved) {
                 sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
-                if (bodyPanel.dragging) {
+                if (bodyPanel.dragging)
                     bodyPanel.pos = mouseScreenF - bodyPanel.dragOffset;
-                }
-                if (controlsPanel.dragging) {
+                if (controlsPanel.dragging)
                     controlsPanel.pos = mouseScreenF - controlsPanel.dragOffset;
-                }
+
                 if (orbitEdit.dragging &&
                     orbitEdit.active &&
                     orbitEdit.bodyIndex >= 0 &&
@@ -1180,40 +1407,38 @@ int main() {
                         (mouseScreenF.x - cx) * metersPerPixel + viewCenterWorld.x,
                         (mouseScreenF.y - cy) * metersPerPixel + viewCenterWorld.y
                     };
-                    applyOrbitDrag(bodies[orbitEdit.bodyIndex], bodies[orbitEdit.parentIndex], mouseWorld);
+                    applyOrbitDrag(bodies[orbitEdit.bodyIndex],
+                                   bodies[orbitEdit.parentIndex],
+                                   mouseWorld);
                 }
             }
-        } // end poll
+        } // pollEvent
 
-        // -------- update physics --------
+        // ----- update physics -----
         float dtSeconds = clock.restart().asSeconds();
         if (dtSeconds > 0.05f) dtSeconds = 0.05f;
         stepSim(bodies, dtSeconds);
 
-        if (viewBodyIndex >= 0 && viewBodyIndex < (int)bodies.size()) {
+        if (viewBodyIndex >= 0 && viewBodyIndex < (int)bodies.size())
             viewCenterWorld = bodies[viewBodyIndex].position;
-        }
 
-        // -------- render --------
+        // ----- render -----
         window.clear(sf::Color(10, 10, 20));
 
         // trails
         if (trailsEnabled) {
             for (const auto& b : bodies) {
                 if (b.trail.size() < 2) continue;
-                std::vector<sf::Vertex> lineVertices;
-                lineVertices.reserve(b.trail.size());
-                for (const auto& p : b.trail) {
-                    lineVertices.emplace_back(
-                        worldToScreen(p, WIDTH, HEIGHT),
-                        sf::Color(150, 150, 150)
-                    );
-                }
-                window.draw(lineVertices.data(), lineVertices.size(), sf::LineStrip);
+                std::vector<sf::Vertex> line;
+                line.reserve(b.trail.size());
+                for (const auto& p : b.trail)
+                    line.emplace_back(worldToScreen(p, WIDTH, HEIGHT),
+                                      sf::Color(150, 150, 150));
+                window.draw(line.data(), line.size(), sf::LineStrip);
             }
         }
 
-        // AddMoving arrow
+        // AddMoving velocity arrow
         if (isDraggingAddMoving) {
             sf::Vector2f startScreen = worldToScreen(dragStart, WIDTH, HEIGHT);
             sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
@@ -1224,12 +1449,12 @@ int main() {
             window.draw(line, 2, sf::Lines);
         }
 
-        // bodies (zoom-aware radius & realistic colours)
+        // bodies
         double zoomScale = 1.0e9 / metersPerPixel;
         for (std::size_t i = 0; i < bodies.size(); ++i) {
             const Body& b = bodies[i];
-            sf::Vector2f pos = worldToScreen(b.position, WIDTH, HEIGHT);
 
+            sf::Vector2f pos = worldToScreen(b.position, WIDTH, HEIGHT);
             float radius = (float)(b.radius * zoomScale);
             if (radius < 2.f)  radius = 2.f;
             if (radius > 60.f) radius = 60.f;
@@ -1237,8 +1462,7 @@ int main() {
             sf::CircleShape c(radius);
             c.setOrigin(radius, radius);
             c.setPosition(pos);
-            sf::Color col = bodyColor(b);
-            c.setFillColor(col);
+            c.setFillColor(bodyColor(b));
 
             if ((int)i == selectedIndex) {
                 c.setOutlineThickness(2.f);
@@ -1250,6 +1474,7 @@ int main() {
                 c.setOutlineThickness(1.5f);
                 c.setOutlineColor(sf::Color(0, 150, 255));
             }
+
             window.draw(c);
         }
 
@@ -1290,7 +1515,6 @@ int main() {
             t.setString(hud);
             window.draw(t);
 
-            // bottom-left: scale & time
             sf::Text s1;
             s1.setFont(font);
             s1.setCharacterSize(14);
@@ -1344,7 +1568,8 @@ int main() {
             mText.setCharacterSize(12);
             mText.setFillColor(sf::Color::White);
             mText.setString(controlsPanel.minimized ? "+" : "-");
-            mText.setPosition(minBtn.getPosition().x + 4.f, minBtn.getPosition().y - 3.f);
+            mText.setPosition(minBtn.getPosition().x + 4.f,
+                              minBtn.getPosition().y - 3.f);
             window.draw(mText);
 
             if (!controlsPanel.minimized) {
@@ -1375,12 +1600,17 @@ int main() {
                 l("Ctrl+R: reset system (with confirm)");
                 l("I/O: zoom in/out");
                 l(", / . : slower / faster time");
+                l("In body editor: L/R click subcomposition bars");
+                l("  to increase/decrease that substance.");
             }
         }
 
-        // Body editor panel
+        // Body editor panel + composition UI
+        bodyPanelControls.valid = false;
+        subCompRects.clear();
         if (fontLoaded && bodyPanel.visible &&
             selectedIndex >= 0 && selectedIndex < (int)bodies.size()) {
+
             Body& b = bodies[selectedIndex];
 
             sf::RectangleShape panel;
@@ -1413,7 +1643,7 @@ int main() {
             window.draw(closeBtn);
 
             sf::RectangleShape minBtn({btnSize, btnSize});
-            minBtn.setPosition(bodyPanel.pos.x + bodyPanel.size.x - 2.f * (btnSize + 4.f),
+            minBtn.setPosition(bodyPanel.pos.x + bodyPanel.size.x - 2.f*(btnSize+4.f),
                                bodyPanel.pos.y + 4.f);
             minBtn.setFillColor(sf::Color(80, 80, 80));
             window.draw(minBtn);
@@ -1427,14 +1657,14 @@ int main() {
                               closeBtn.getPosition().y - 2.f);
             window.draw(xText);
 
-            sf::Text mText;
-            mText.setFont(font);
-            mText.setCharacterSize(12);
-            mText.setFillColor(sf::Color::White);
-            mText.setString(bodyPanel.minimized ? "+" : "-");
-            mText.setPosition(minBtn.getPosition().x + 4.f,
-                              minBtn.getPosition().y - 3.f);
-            window.draw(mText);
+            sf::Text mText2;
+            mText2.setFont(font);
+            mText2.setCharacterSize(12);
+            mText2.setFillColor(sf::Color::White);
+            mText2.setString(bodyPanel.minimized ? "+" : "-");
+            mText2.setPosition(minBtn.getPosition().x + 4.f,
+                               minBtn.getPosition().y - 3.f);
+            window.draw(mText2);
 
             if (!bodyPanel.minimized) {
                 sf::Text line;
@@ -1451,25 +1681,16 @@ int main() {
                     y += 20.f;
                 };
 
-                // name / type
                 if (renaming)
                     drawLine("Name: " + renameBuffer + "_");
                 else
                     drawLine("Name: " + b.name + "  (F2 to rename)");
 
                 drawLine("Type: " + b.typeInfo.name);
-
-                // simple type hint / cycling
-                drawLine("Change type: [<] [>] (not clickable yet)");
-
-                // mass (editable via +/-)
                 drawLine("Mass: " + formatSci(b.mass) + " kg");
-
-                // density & radius
                 drawLine("Density: " + formatSci(b.density));
                 drawLine("Base radius: " + formatSci(b.radius) + " px");
 
-                // temperature
                 if (isStar(b)) {
                     drawLine("Star T: " + formatSci(b.temperatureK) + " K");
                     drawLine("Lum: " + formatSci(b.luminosityW) + " W");
@@ -1478,15 +1699,94 @@ int main() {
                     drawLine("Albedo: " + formatSci(b.albedo));
                 }
 
-                // composition summary
                 char buf[128];
                 std::snprintf(buf, sizeof(buf),
                               "Comp R/M/I/G/W: %.2f/%.2f/%.2f/%.2f/%.2f",
-                              b.comp.rock, b.comp.metal, b.comp.ice,
-                              b.comp.gas, b.comp.water);
+                              b.bulk.rock, b.bulk.metal, b.bulk.ice,
+                              b.bulk.gas, b.bulk.water);
                 drawLine(buf);
 
-                // flags
+                // primary composition clickable boxes
+                line.setPosition(x, y);
+                line.setString("Primary composition (click):");
+                window.draw(line);
+                y += 18.f;
+
+                float boxW = 26.f, boxH = 14.f, gap = 6.f;
+                float bx = x;
+                float by = y;
+
+                auto drawCompBox = [&](const char* label,
+                                       const sf::Color& col,
+                                       const sf::FloatRect& rect) {
+                    sf::RectangleShape r({boxW, boxH});
+                    r.setPosition(rect.left, rect.top);
+                    r.setFillColor(col);
+                    r.setOutlineThickness(1.f);
+                    r.setOutlineColor(sf::Color::White);
+                    window.draw(r);
+
+                    sf::Text lbl;
+                    lbl.setFont(font);
+                    lbl.setCharacterSize(11);
+                    lbl.setFillColor(sf::Color::White);
+                    lbl.setString(label);
+                    lbl.setPosition(rect.left, rect.top + boxH + 2.f);
+                    window.draw(lbl);
+                };
+
+                bodyPanelControls.valid = true;
+                bodyPanelControls.compRock  = sf::FloatRect(bx, by, boxW, boxH);
+                bodyPanelControls.compMetal = sf::FloatRect(bx + (boxW+gap)*1, by, boxW, boxH);
+                bodyPanelControls.compIce   = sf::FloatRect(bx + (boxW+gap)*2, by, boxW, boxH);
+                bodyPanelControls.compGas   = sf::FloatRect(bx + (boxW+gap)*3, by, boxW, boxH);
+                bodyPanelControls.compWater = sf::FloatRect(bx + (boxW+gap)*4, by, boxW, boxH);
+
+                drawCompBox("Rock",  sf::Color(150,120,90), bodyPanelControls.compRock);
+                drawCompBox("Metal", sf::Color(180,180,190), bodyPanelControls.compMetal);
+                drawCompBox("Ice",   sf::Color(170,220,255), bodyPanelControls.compIce);
+                drawCompBox("Gas",   sf::Color(200,170,120), bodyPanelControls.compGas);
+                drawCompBox("Water", sf::Color(60,110,170),  bodyPanelControls.compWater);
+
+                y += boxH + 26.f;
+
+                // detailed subcomposition
+                line.setPosition(x, y);
+                line.setString("Detailed composition (L/R click bars):");
+                window.draw(line);
+                y += 18.f;
+
+                subCompRects.clear();
+                const float barW = bodyPanel.size.x - 24.f;
+                const float barH = 10.f;
+
+                for (std::size_t i = 0; i < b.sub.size() && i < 7; ++i) {
+                    const auto& sc = b.sub[i];
+                    float frac = (float)std::clamp(sc.fraction, 0.0, 1.0);
+
+                    sf::RectangleShape bg({barW, barH});
+                    bg.setPosition(x, y);
+                    bg.setFillColor(sf::Color(40, 40, 60));
+                    window.draw(bg);
+
+                    sf::RectangleShape fg({barW * frac, barH});
+                    fg.setPosition(x, y);
+                    fg.setFillColor(sf::Color(100, 180, 220));
+                    window.draw(fg);
+
+                    sf::Text lbl;
+                    lbl.setFont(font);
+                    lbl.setCharacterSize(11);
+                    lbl.setFillColor(sf::Color::White);
+                    std::snprintf(buf, sizeof(buf), "%s: %.2f", sc.name.c_str(), sc.fraction);
+                    lbl.setString(buf);
+                    lbl.setPosition(x, y + barH + 1.f);
+                    window.draw(lbl);
+
+                    subCompRects.emplace_back(x, y, barW, barH);
+                    y += barH + 18.f;
+                }
+
                 std::string flags = "Fixed: ";
                 flags += (b.fixed ? "Yes" : "No");
                 flags += "   Volume lock: ";
