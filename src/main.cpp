@@ -1586,9 +1586,18 @@ int main() {
             spr.setPosition(pos);
 
             gPlanetShader.setUniform("texture", gPlanetMask);
-            gPlanetShader.setUniform("baseColor", sf::Glsl::Vec3(bodyColor(b)));
+
+            // convert sf::Color -> normalized RGB vec3
+            sf::Color c = bodyColor(b);
+            sf::Glsl::Vec3 colVec(
+                c.r / 255.f,
+                c.g / 255.f,
+                c.b / 255.f
+            );
+            gPlanetShader.setUniform("baseColor", colVec);
+
             gPlanetShader.setUniform("lightDir",
-                                     sf::Glsl::Vec2((float)L.x, (float)L.y));
+                                    sf::Glsl::Vec2((float)L.x, (float)L.y));
             gPlanetShader.setUniform("ambient", ambient);
 
             window.draw(spr, &gPlanetShader);
