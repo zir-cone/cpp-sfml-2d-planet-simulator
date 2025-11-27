@@ -1539,8 +1539,64 @@ int main() {
 
             bool isStarBody = isStar(b);
 
-            // --- Stars: simple glowing discs (no shader for now) ---
-            if (isStarBody || !gHasLightingShader) {
+            // --- Stars: bright core + glow using additive blending ---
+            if (isStarBody) {
+                sf::Color col = bodyColor(b); // already based on temperature
+
+                // Big outer glow
+                float glowOuterR = radiusPx * 2.4f;
+                sf::CircleShape glowOuter(glowOuterR);
+                glowOuter.setOrigin(glowOuterR, glowOuterR);
+                glowOuter.setPosition(pos);
+                glowOuter.setFillColor(sf::Color(col.r, col.g, col.b, 40)); // very soft
+                window.draw(glowOuter, sf::BlendAdd);
+
+                // Inner glow
+                float glowInnerR = radiusPx * 1.6f;
+                sf::CircleShape glowInner(glowInnerR);
+                glowInner.setOrigin(glowInnerR, glowInnerR);
+                glowInner.setPosition(pos);
+                glowInner.setFillColor(sf::Color(col.r, col.g, col.b, 90));
+                window.draw(glowInner, sf::BlendAdd);
+
+                // Hot core
+                float coreR = radiusPx * 0.8f;
+                sf::CircleShape core(coreR);
+                core.setOrigin(coreR, coreR);
+                core.setPosition(pos);
+
+                // core tends toward white to look hotter
+                sf::Color coreCol(
+                    std::min<int>(255, col.r + 60),
+                    std::min<int>(255, col.g + 60),
+                    std::min<int>(255, col.b + 60)
+                );
+                core.setFillColor(coreCol);
+                window.draw(core);
+
+                // Selection / fixed / ghost outline on top
+                sf::CircleShape outline(radiusPx);
+                outline.setOrigin(radiusPx, radiusPx);
+                outline.setPosition(pos);
+                outline.setFillColor(sf::Color::Transparent);
+
+                if ((int)i == selectedIndex) {
+                    outline.setOutlineThickness(2.f);
+                    outline.setOutlineColor(sf::Color::Red);
+                } else if (b.fixed) {
+                    outline.setOutlineThickness(1.5f);
+                    outline.setOutlineColor(sf::Color(230, 230, 80));
+                } else if (b.ghost) {
+                    outline.setOutlineThickness(1.5f);
+                    outline.setOutlineColor(sf::Color(0, 150, 255));
+                }
+
+                window.draw(outline);
+                continue; // skip planet lighting path
+            }
+
+            // --- Planets etc with no shader available: flat circle fallback ---
+            if (!gHasLightingShader) {
                 sf::CircleShape c(radiusPx);
                 c.setOrigin(radiusPx, radiusPx);
                 c.setPosition(pos);
@@ -1560,6 +1616,7 @@ int main() {
                 window.draw(c);
                 continue;
             }
+
 
             // --- Planets/etc: shaded sprite with shader ---
             // find nearest star for light direction
