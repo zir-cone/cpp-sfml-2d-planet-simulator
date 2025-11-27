@@ -242,6 +242,23 @@ void updateTemperatures(std::vector<Body>& bodies) {
     }
 }
 
+int findNearestStar(const std::vector<Body>& bodies, int bodyIndex) {
+    int best = -1;
+    double bestDist2 = 1e99;
+    for (int i = 0; i < (int)bodies.size(); ++i) {
+        if (i == bodyIndex) continue;
+        if (!isStar(bodies[i])) continue;
+        Vec2 d{ bodies[i].position.x - bodies[bodyIndex].position.x,
+                bodies[i].position.y - bodies[bodyIndex].position.y };
+        double d2 = d.x*d.x + d.y*d.y;
+        if (d2 < bestDist2) {
+            bestDist2 = d2;
+            best = i;
+        }
+    }
+    return best;
+}
+
 // --------------------
 // Star & planet category helpers
 // --------------------
@@ -900,8 +917,44 @@ void setPrimaryComposition(Body& b, const std::string& which) {
     updatePlanetCategoryFromComp(b);
 }
 
+// -------- Lighting (shader) --------
+sf::Texture gPlanetMask;
+sf::Shader  gPlanetShader;
+bool gHasLightingShader = false;
+
+const char* PLANET_FRAGMENT_SHADER = R"(
+uniform sampler2D texture;
+uniform vec3 baseColor;
+uniform vec2 lightDir;  // direction *to* the light in world/screen space
+uniform float ambient;
+
+void main()
+{
+    vec2 uv = gl_TexCoord[0].xy;
+    vec4 mask = texture2D(texture, uv);
+    if (mask.a < 0.05)
+        discard;
+
+    // Map UV -> [-1,1] circle coordinates
+    vec2 p = uv * 2.0 - 1.0;
+    float r2 = dot(p, p);
+    if (r2 > 1.0)
+        discard;
+
+    // 2D Lambert shading
+    vec2 n = normalize(p);          // surface normal in screen plane
+    vec2 L = normalize(lightDir);   // direction *to* the star
+    float ndotl = max(dot(n, L), 0.0);
+    float lighting = ambient + (1.0 - ambient) * ndotl;
+
+    vec3 col = baseColor * lighting;
+    gl_FragColor = vec4(col, mask.a);
+}
+)";
+
+
 // --------------------
-// main
+// fml
 // --------------------
 int main() {
     const unsigned int WIDTH = 1280;
@@ -909,6 +962,31 @@ int main() {
 
     sf::RenderWindow window(sf::VideoMode(WIDTH, HEIGHT), "PlanetSim.exe");
     window.setFramerateLimit(120);
+
+        // --- Lighting init ---
+    if (sf::Shader::isAvailable()) {
+        // circular alpha mask
+        sf::Image img;
+        const int TEX_SIZE = 256;
+        img.create(TEX_SIZE, TEX_SIZE, sf::Color::Transparent);
+        for (int y = 0; y < TEX_SIZE; ++y) {
+            for (int x = 0; x < TEX_SIZE; ++x) {
+                float fx = (x + 0.5f) / TEX_SIZE * 2.f - 1.f;
+                float fy = (y + 0.5f) / TEX_SIZE * 2.f - 1.f;
+                float r2 = fx*fx + fy*fy;
+                if (r2 <= 1.f) {
+                    img.setPixel(x, y, sf::Color(255, 255, 255, 255));
+                }
+            }
+        }
+        gPlanetMask.loadFromImage(img);
+        gPlanetMask.setSmooth(true);
+
+        gHasLightingShader =
+            gPlanetShader.loadFromMemory(PLANET_FRAGMENT_SHADER, sf::Shader::Fragment);
+    } else {
+        gHasLightingShader = false;
+    }
 
     std::vector<Body> bodies;
 
@@ -1449,33 +1527,90 @@ int main() {
             window.draw(line, 2, sf::Lines);
         }
 
-        // bodies
+        // bodies (with lighting)
         double zoomScale = 1.0e9 / metersPerPixel;
         for (std::size_t i = 0; i < bodies.size(); ++i) {
             const Body& b = bodies[i];
 
             sf::Vector2f pos = worldToScreen(b.position, WIDTH, HEIGHT);
-            float radius = (float)(b.radius * zoomScale);
-            if (radius < 2.f)  radius = 2.f;
-            if (radius > 60.f) radius = 60.f;
+            float radiusPx = (float)(b.radius * zoomScale);
+            if (radiusPx < 2.f)  radiusPx = 2.f;
+            if (radiusPx > 60.f) radiusPx = 60.f;
 
-            sf::CircleShape c(radius);
-            c.setOrigin(radius, radius);
-            c.setPosition(pos);
-            c.setFillColor(bodyColor(b));
+            bool isStarBody = isStar(b);
 
-            if ((int)i == selectedIndex) {
-                c.setOutlineThickness(2.f);
-                c.setOutlineColor(sf::Color::Red);
-            } else if (b.fixed) {
-                c.setOutlineThickness(1.5f);
-                c.setOutlineColor(sf::Color(230, 230, 80));
-            } else if (b.ghost) {
-                c.setOutlineThickness(1.5f);
-                c.setOutlineColor(sf::Color(0, 150, 255));
+            // --- Stars: simple glowing discs (no shader for now) ---
+            if (isStarBody || !gHasLightingShader) {
+                sf::CircleShape c(radiusPx);
+                c.setOrigin(radiusPx, radiusPx);
+                c.setPosition(pos);
+                c.setFillColor(bodyColor(b));
+
+                if ((int)i == selectedIndex) {
+                    c.setOutlineThickness(2.f);
+                    c.setOutlineColor(sf::Color::Red);
+                } else if (b.fixed) {
+                    c.setOutlineThickness(1.5f);
+                    c.setOutlineColor(sf::Color(230, 230, 80));
+                } else if (b.ghost) {
+                    c.setOutlineThickness(1.5f);
+                    c.setOutlineColor(sf::Color(0, 150, 255));
+                }
+
+                window.draw(c);
+                continue;
             }
 
-            window.draw(c);
+            // --- Planets/etc: shaded sprite with shader ---
+            // find nearest star for light direction
+            int starIdx = findNearestStar(bodies, (int)i);
+            Vec2 L{1.0, 0.0};
+            float ambient = 0.3f;
+
+            if (starIdx >= 0) {
+                Vec2 d{ bodies[starIdx].position.x - b.position.x,
+                        bodies[starIdx].position.y - b.position.y }; // planet->star
+                double len = length(d);
+                if (len > 0.0) {
+                    L.x = d.x / len;
+                    L.y = d.y / len;
+                    ambient = 0.12f;
+                }
+            }
+
+            // sprite scaled from unit circle texture
+            sf::Sprite spr(gPlanetMask);
+            spr.setOrigin(128.f, 128.f); // TEX_SIZE / 2
+            float scale = radiusPx / 128.f; // radius vs half texture size
+            spr.setScale(scale, scale);
+            spr.setPosition(pos);
+
+            gPlanetShader.setUniform("texture", gPlanetMask);
+            gPlanetShader.setUniform("baseColor", sf::Glsl::Vec3(bodyColor(b)));
+            gPlanetShader.setUniform("lightDir",
+                                     sf::Glsl::Vec2((float)L.x, (float)L.y));
+            gPlanetShader.setUniform("ambient", ambient);
+
+            window.draw(spr, &gPlanetShader);
+
+            // outlines (selection / fixed / ghost)
+            sf::CircleShape outline(radiusPx);
+            outline.setOrigin(radiusPx, radiusPx);
+            outline.setPosition(pos);
+            outline.setFillColor(sf::Color::Transparent);
+
+            if ((int)i == selectedIndex) {
+                outline.setOutlineThickness(2.f);
+                outline.setOutlineColor(sf::Color::Red);
+            } else if (b.fixed) {
+                outline.setOutlineThickness(1.5f);
+                outline.setOutlineColor(sf::Color(230, 230, 80));
+            } else if (b.ghost) {
+                outline.setOutlineThickness(1.5f);
+                outline.setOutlineColor(sf::Color(0, 150, 255));
+            }
+
+            window.draw(outline);
         }
 
         // orbit overlay
