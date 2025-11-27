@@ -46,6 +46,7 @@ std::string formatDistance(double meters) {
     else                       std::snprintf(buf, sizeof(buf), "%.0f m",  meters);
     return std::string(buf);
 }
+// Im Gonna Kill Myself <3 <3 <3 xoxoxo
 
 // --------------------
 // Types & composition
@@ -132,7 +133,7 @@ struct Body {
 // --------------------
 const double G_PHYS       = 6.67430e-11;              // m^3 kg^-1 s^-2
 const double SIGMA_SB     = 5.670374419e-8;           // W m^-2 K^-4
-const double YEAR_SECONDS = 365.25 * 24.0 * 3600.0;
+const double YEAR_SECONDS = 365.25 * 24.0 * 3600.0;   // Yuh, what is this diddy blud doing on the calculator, is blud Einsten?
 
 const double M_SUN   = 1.98847e30;
 const double M_EARTH = 5.97219e24;
@@ -149,13 +150,13 @@ bool lockVolume     = false;
 
 // helpers radius/density
 double computeVolumeFromRadius(double r) {
-    const double pi = 3.141592653589793;
+    const double pi = 3.141592653589793;            // What is this diddy blud doing on the calculator? Is blud Einsten? What is this diddyblud doing on the calculator? Does he think he is, Epstein?
     return 4.0 / 3.0 * pi * r * r * r;
 }
 double computeRadiusFromMassDensity(double mass, double density) {
     if (density <= 0.0) density = 1.0;
     double volume = mass / density;
-    const double pi = 3.141592653589793;
+    const double pi = 3.141592653589793;           // pi lwk tuff bro lk tht 3.14159 vro ra 🌹💖
     return std::cbrt((3.0 * volume) / (4.0 * pi));
 }
 void updateBodyAfterMassChange(Body& b) {
@@ -708,7 +709,7 @@ void applyOrbitDrag(Body& body, Body& parent, const Vec2& mouseWorld) {
 
     updateBodyFromOrbit(body, parent);
 }
-
+// Assassinate Yakub
 // --------------------
 // Draw helpers
 // --------------------
@@ -1222,6 +1223,10 @@ int main() {
                                 bodyPanel.dragOffset = mouseScreenF - bodyPanel.pos;
                                 continue;
                             }
+                            // if somebody other than me ever happens to read this code
+                            // and doesnt know c++ please never learn this language
+                            // if you do know c++ please unlearn this language
+                            // this shit the type of pain used in hell 🥀🥀🥀
                         } else if (panelRect.contains(mouseScreenF)) {
                             // content click: primary comp boxes
                             if (selectedIndex >= 0 &&
@@ -1271,7 +1276,6 @@ int main() {
                         }
                     }
                 }
-
                 // ----- Controls panel -----
                 if (controlsPanel.visible) {
                     sf::FloatRect titleRect(controlsPanel.pos.x, controlsPanel.pos.y,
@@ -1339,14 +1343,14 @@ int main() {
                         b.albedo   = 0.25;
                         b.name     = "Rocky body";
                         b.sub = {
-                            {"Silicate rock", 0.67},
+                            {"Silicate rock", 0.67}, // 67 🥀🥀🥀🥀🥀🥀🥀🥀🥀🥀
                             {"Iron",          0.32},
                             {"Water",         0.01},
                             {"Nitrogen",      0.0},
                             {"Oxygen",        0.0},
                             {"CO2",           0.0},
                             {"Methane",       0.0},
-                            {"Argon",         0.0}
+                            {"Argon",         0.0}  // argontha Absolutely Vriliant
                         };
                         recomputeBulkComposition(b);
                         b.color    = bodyColor(b);
@@ -1448,7 +1452,7 @@ int main() {
                         b.albedo   = 0.25;
                         b.name     = "Moving body";
                         b.sub = {
-                            {"Silicate rock", 0.67},
+                            {"Silicate rock", 0.67},    // SIX SEVEN!!! 🥀🆘🆘🪫🪫🪫💔💔💔💔🧔‍♂️🚡🚡
                             {"Iron",          0.32},
                             {"Water",         0.01},
                             {"Nitrogen",      0.0},
@@ -1465,6 +1469,8 @@ int main() {
                     }
                 }
             }
+            // ive lost my shit. i feel like ts is ass but its actually very fine verily i say ergo!
+            // "i havent slept properly in weeks" vro tk sh's shkpr 🪫🥀💔🎋🌾
             else if (event.type == sf::Event::MouseMoved) {
                 sf::Vector2f mouseScreenF = window.mapPixelToCoords(sf::Mouse::getPosition(window));
                 if (bodyPanel.dragging)
@@ -1491,7 +1497,12 @@ int main() {
                 }
             }
         } // pollEvent
-
+        // i passed out cold on my desk yesterday (or earlier today depending on your perspective on the matter) and i had a dream about
+        // being at an wnba basketball game with santa claus and he opened up his gift-bag and started going, "Ho ho ho! Merry Christmas to all!"
+        // while throwing sex toys into the court :sob:. ikyn my brain was making up shit on the spot too, like instead of throwing dildos and
+        // vibrators he'd just throw some random ass doohickey like twomad...
+        // good thing i wasnt lucid in that cause if i was id be laughing my ass off so hard id probably wake up. i dont get why people get so
+        // agitated over shit like this its just goofy as fuck. wbna sucks dick anyhow.
         // ----- update physics -----
         float dtSeconds = clock.restart().asSeconds();
         if (dtSeconds > 0.05f) dtSeconds = 0.05f;
@@ -1916,7 +1927,7 @@ int main() {
                 float boxW = 26.f, boxH = 14.f, gap = 6.f;
                 float bx = x;
                 float by = y;
-
+                // #StopGooning
                 auto drawCompBox = [&](const char* label,
                                        const sf::Color& col,
                                        const sf::FloatRect& rect) {
